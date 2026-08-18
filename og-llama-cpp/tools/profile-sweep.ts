@@ -19,9 +19,7 @@ import path from "node:path";
 
 const WIN = process.platform === "win32";
 const HOME = os.homedir();
-const INSTALLER = WIN
-	? "llama-cpp-installation\\install-engine.ps1"
-	: "llama-cpp-installation/install-engine.sh";
+const INSTALLER = WIN ? ".\\install-engine.ps1" : "./install-engine.sh";
 
 interface SweepCase {
 	label: string;

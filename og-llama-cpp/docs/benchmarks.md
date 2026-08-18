@@ -1,6 +1,7 @@
 # Measurement record
 
-Every profile number in `src/config/load.ts` comes from this document, and this document comes
+Every shipped profile number in the `og` CLI (`src/config/load.ts` in the sibling `../../og-cli`
+checkout) comes from this document, and this document comes
 from runs on one machine. It exists so that a future engine upgrade can be validated against
 real prior art instead of vibes, and so that nobody has to re-derive why the fastest number in
 the table is not the default.
@@ -8,7 +9,7 @@ the table is not the default.
 Reproduce with `bun run tools/bench.ts` (raw kernel ceiling) and `bun run tools/profile-sweep.ts`
 (serving profiles); both are cross-platform. The numbers recorded below were produced by the
 PowerShell predecessors of those two scripts, on the Windows install described in §1. Re-run both
-after any llama.cpp upgrade — see [`runbook.md` §6](runbook.md#6-upgrading-llamacpp).
+after any llama.cpp upgrade — see [`upgrading.md`](upgrading.md).
 
 ---
 
@@ -22,7 +23,7 @@ after any llama.cpp upgrade — see [`runbook.md` §6](runbook.md#6-upgrading-ll
 | RAM | 64 GiB |
 | OS | Windows 11 Pro, build 26200 |
 | Engine | llama.cpp build **b10488**, commit `9d77fa172` |
-| Binaries | prebuilt `llama-b10488-bin-win-cuda-13.3-x64.zip` + `cudart-llama-bin-win-cuda-13.3-x64.zip`, installed to `%USERPROFILE%\.local\llama.cpp\b10488` with a `current` junction (`llama-cpp-installation/install-engine.ps1`) |
+| Binaries | prebuilt `llama-b10488-bin-win-cuda-13.3-x64.zip` + `cudart-llama-bin-win-cuda-13.3-x64.zip`, installed to `%USERPROFILE%\.local\llama.cpp\b10488` with a `current` junction (`install-engine.ps1`) |
 | Idle GPU use | **968 MiB** with the desktop up and no model loaded |
 | Working budget | **15200 MiB** resident (16303 total, headroom held for the desktop) |
 

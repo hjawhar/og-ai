@@ -8,10 +8,11 @@ same GPU and have not been re-measured under Linux — the card and the build ar
 remain the right expectations, but treat them as unverified on Linux. From a source checkout,
 substitute `bun run src/index.ts` for `og`.
 
-`og` itself installs and upgrades through npm: `npm i -g @hjawhar/og-cli`, or
-`npm i -g @hjawhar/og-cli@<version>` to pin a known-good one. The package carries a prebuilt,
-self-contained binary per platform, so there is no local build-and-copy step and no Bun on the
-box unless you are working from a checkout. Engine upgrades are a separate drill (§6).
+`og` is built, not installed from a registry: `bun run build` produces one self-contained
+`dist/og` that you copy onto `PATH`. See [`../README.md`](../README.md#install). Installing and
+upgrading the inference engine is a separate concern in a separate repository — the sibling
+checkout `../og-llama-cpp` — and its drill is
+[`../../og-llama-cpp/docs/upgrading.md`](../../og-llama-cpp/docs/upgrading.md).
 
 ---
 
@@ -286,12 +287,11 @@ Get-Item $env:USERPROFILE\.local\llama.cpp\current | Select-Object LinkType, Tar
 ```
 
 - `llama-server not found at ...` — `engine.binDir` is wrong, or `current` no longer resolves.
-  On Linux re-run `llama-cpp-installation/install-engine.sh`; it rebuilds the pinned tag from
+  On Linux re-run `../og-llama-cpp/install-engine.sh`; it rebuilds the pinned tag from
   source and re-points the `current` symlink at the result. On Windows re-run
-  `powershell -ExecutionPolicy Bypass -File llama-cpp-installation/install-engine.ps1`; it
+  `powershell -ExecutionPolicy Bypass -File ..\og-llama-cpp\install-engine.ps1`; it
   re-downloads the release zips and re-creates the `current` junction. Engine installation is a
-  separate concern from the CLI: it lives in `llama-cpp-installation/`, while `tools/` holds only
-  `release.ts`, `bench.ts` and `profile-sweep.ts`.
+  separate concern from the CLI and lives in its own repository (§6).
 - Linux — `error while loading shared libraries: libcudart.so.13` (or `libcublas`, `libcublasLt`):
   the CUDA runtime libraries are missing from `engine.binDir`. Re-run the installer: it copies them
   in next to `llama-server` and links with `RPATH=$ORIGIN`, so the server needs no
@@ -434,152 +434,35 @@ usually ends with the model explaining it could not proceed. Fixes, in order of 
   the gate.
 - Run interactively for one-offs: the TUI prompts, and `/help` lists everything else available.
 
-## 6. Upgrading llama.cpp
+## 6. Engine installs and upgrades
 
-Pinned build: **b10488** (commit `9d77fa172`) — compiled from the `b10488` tag by
-`llama-cpp-installation/install-engine.sh` on Linux, unzipped from the upstream release by
-`llama-cpp-installation/install-engine.ps1` on Windows — engine installation is a separate concern
-from the CLI, so it lives in `llama-cpp-installation/` while `tools/` holds only `release.ts`,
-`bench.ts` and `profile-sweep.ts`. Upstream publishes no Linux CUDA release asset —
-its CUDA archives (`llama-b10488-bin-win-cuda-13.3-x64.zip` +
-`cudart-llama-bin-win-cuda-13.3-x64.zip`) are Windows-only — so on Linux bumping the build means a
-rebuild, not a download.
+Not this project's concern. `og` supervises whatever OpenAI-compatible server
+`cfg.endpoint` names; getting a pinned llama.cpp CUDA `llama-server` onto the box, bumping its
+build, rolling one back and building it by hand all live in the sibling `../og-llama-cpp`
+directory:
+
+| Task | Where |
+| --- | --- |
+| Install the pinned build (Linux and Windows) | `../../og-llama-cpp/README.md` |
+| Bump the build, revalidate, roll back | `../../og-llama-cpp/docs/upgrading.md` |
+| Build llama.cpp by hand | `../../og-llama-cpp/docs/building-by-hand.md` |
+| VRAM and throughput per profile, measured | `../../og-llama-cpp/docs/benchmarks.md` |
+
+Two things stay this project's problem after an engine upgrade:
+
+- **Re-check VRAM for every profile you use** — `og engine status`. Kernel and allocator changes
+  move the spill threshold by hundreds of MiB, and the failure is silent (§4).
+- **Re-check the flag names.** Only `src/engine/args.ts` builds the argv, and its flags were
+  verified against b10488's `llama-server --help`: `-ngl`, `--n-cpu-moe`, `-c`,
+  `--cache-type-k/v`, `--flash-attn on|off`, `--jinja`, `-t`, `-b`, `-ub`, `--parallel`,
+  `--no-webui`, `--metrics`, `--cont-batching`, and the sampling flags. A renamed or removed flag
+  shows up as an immediate startup failure with the argv in the message, which is the good kind
+  of failure.
+
+The smoke test after any engine change is three commands:
 
 ```sh
-# 1. build and install the new tag; nothing in the repo needs editing. This clones the tag
-#    into ~/.local/src/llama.cpp-bNNNNN, compiles ggml-cuda from source, installs into
-#    ~/.local/llama.cpp/bNNNNN and re-points the `current` symlink at it
-OG_LLAMA_BUILD=bNNNNN llama-cpp-installation/install-engine.sh
-
-# 2. verify the symlink and the binary
-ls -l ~/.local/llama.cpp/current
-~/.local/llama.cpp/current/llama-server --version
-
-# 3. restart under the new build and smoke test
-og engine stop
-og engine start
-og engine status
+og engine stop && og engine start && og engine status
 og -p "reply with the single word ready" --max-steps 1
 og --json -p "list the files in src/ and count them"   # exercises tools end to end
-
-# 4. RE-CHECK VRAM for every profile you use
-og engine status      # vram used/total, per profile
 ```
-
-On Windows only step 1 differs: `install-engine.ps1` pins the tag in a `$build` variable at the
-top of the script rather than reading an env var, so edit it and re-run. The download lands in
-`%USERPROFILE%\.local\llama.cpp\bNNNNN` and the `current` junction is re-created pointing there.
-Steps 3 and 4 are plain `og` commands and run unchanged.
-
-```powershell
-# 1. change $build = 'b10488' to the new tag, then re-run the installer
-notepad llama-cpp-installation\install-engine.ps1
-powershell -ExecutionPolicy Bypass -File llama-cpp-installation\install-engine.ps1
-
-# 2. verify the junction and the binary
-Get-Item $env:USERPROFILE\.local\llama.cpp\current | Select-Object LinkType, Target
-& $env:USERPROFILE\.local\llama.cpp\current\llama-server.exe --version
-```
-
-Step 4 is not optional. Kernel and allocator changes between builds move the spill threshold by
-hundreds of MiB in either direction, and the failure is silent (§4). Re-run at least the default
-profile at a realistic prefill and compare generation tok/s against
-[`benchmarks.md`](benchmarks.md); a 3x-8x drop means you are over the line and `nCpuMoe` needs
-raising for the new build.
-
-Rollback is trivial because builds are installed side by side under
-`~/.local/llama.cpp/<build>` (`%USERPROFILE%\.local\llama.cpp\<build>` on Windows): re-point the
-symlink or junction and restart. Nothing is rebuilt or re-downloaded.
-
-```sh
-ln -sfn ~/.local/llama.cpp/b10488 ~/.local/llama.cpp/current
-og engine stop && og engine start
-```
-
-On Windows (PowerShell) — a junction cannot be retargeted in place, so remove and re-create it:
-
-```powershell
-Remove-Item $env:USERPROFILE\.local\llama.cpp\current -Force
-New-Item -ItemType Junction -Path $env:USERPROFILE\.local\llama.cpp\current -Target $env:USERPROFILE\.local\llama.cpp\b10488
-```
-
-Also verify flag names survive the upgrade — `buildServerArgs` emits `-ngl`, `--n-cpu-moe`,
-`-c`, `--cache-type-k/v`, `--flash-attn on|off`, `--jinja`, `-t`, `-b`, `-ub`, `--parallel`,
-`--no-webui`, `--metrics`, `--cont-batching`, and the sampling flags. All were verified against
-b10488's `llama-server --help`. A renamed or removed flag shows up as an immediate startup
-failure with the argv in the message, which is the good kind of failure.
-
-## 7. Building llama.cpp by hand
-
-`llama-cpp-installation/install-engine.sh` already does this — on Linux a CUDA `llama-server` can
-only come from a local build, because upstream ships no Linux CUDA asset. That script is the
-maintained install path, and `llama-cpp-installation/README.md` documents it end to end, including
-the rootless CUDA toolkit setup the reference box below assumes. Do it by hand only when you need
-something the script does not pin: a patched llama.cpp, a different CUDA architecture list, or
-a debug build. (There is no Windows counterpart to this section:
-`llama-cpp-installation/install-engine.ps1` unzips the upstream CUDA release, so nothing is
-compiled there.)
-
-**Required, and what the reference box has:**
-
-- **CUDA Toolkit >= 12.8** for `nvcc` — `sm_120` needs at least 12.8. This box unpacks CUDA
-  13.3 under `~/.local/cuda-13.3` with a `~/.local/cuda` symlink, so no part of the toolchain
-  is installed as root.
-- **A host C++ compiler** for `nvcc` to drive — GCC 15.2 here, which CUDA 13.3 accepts.
-- **CMake** >= 3.18 (kept under `~/.local/cmake` on this box) and **git**.
-
-```sh
-git clone --depth 1 --branch b10488 https://github.com/ggml-org/llama.cpp.git
-cd llama.cpp
-
-# staging install, so the copy step below has a predictable layout
-cmake -B build -DCMAKE_BUILD_TYPE=Release \
-  -DGGML_CUDA=ON \
-  -DCMAKE_CUDA_ARCHITECTURES=120 \
-  -DCMAKE_CUDA_COMPILER="$HOME/.local/cuda/bin/nvcc" \
-  -DLLAMA_CURL=OFF \
-  -DBUILD_SHARED_LIBS=ON \
-  -DCMAKE_INSTALL_PREFIX="$PWD/stage" \
-  -DCMAKE_INSTALL_RPATH='$ORIGIN' \
-  -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
-cmake --build build --target install -j"$(nproc)"
-
-# install alongside the other builds as one flat directory, and re-point `current`
-dest=~/.local/llama.cpp/src-9d77fa172
-mkdir -p "$dest"
-cp -f stage/bin/* "$dest"/
-cp -f stage/lib/*.so* "$dest"/
-cp -fP ~/.local/cuda/lib64/libcudart.so.* ~/.local/cuda/lib64/libcublas.so.* \
-       ~/.local/cuda/lib64/libcublasLt.so.* "$dest"/
-ln -sfn "$dest" ~/.local/llama.cpp/current
-```
-
-`LLAMA_CURL=OFF` drops the libcurl dev dependency: `og` always passes a local `-m` path and
-never asks `llama-server` to download weights. `RPATH=$ORIGIN` plus those copied CUDA runtime
-libraries are what make `engine.binDir` self-contained — `og` spawns the server with a bare
-argv, no `LD_LIBRARY_PATH`, and the install survives moving or deleting the toolkit.
-
-`nvcc --version` and `cmake --version` must both answer before the configure step.
-`install-engine.sh` checks for them up front and refuses with `no nvcc at <path>/bin/nvcc`; by
-hand you get CMake's compiler-detection failure instead, which is noisier and later.
-
-### Why `-DCMAKE_CUDA_ARCHITECTURES=120`
-
-The RTX 5070 Ti is Blackwell with **compute capability 12.0**, and CUDA architecture numbers
-are the capability with the dot removed: 12.0 -> `120` (`sm_120`). Building only `120` produces
-native SASS for exactly this GPU — smallest binary, fastest build, no JIT warm-up on first
-kernel launch. The defaults compile a fat binary for many architectures, which takes far longer
-and gains nothing on a single-GPU box.
-
-If you build for a machine with a different card, set the architecture to match that card's
-capability (Ada = `89`, Ampere = `86`/`80`, Hopper = `90`), or list several:
-`-DCMAKE_CUDA_ARCHITECTURES="86;89;120"` — `OG_CUDA_ARCH` is the same dial for
-`install-engine.sh`, which otherwise reads the capability from `nvidia-smi` itself. Confirm the
-target's capability with:
-
-```sh
-nvidia-smi --query-gpu=name,compute_cap --format=csv
-```
-
-Building for the wrong architecture is another silent-performance failure: the driver JITs from
-PTX if it can, and the kernels are slower than native.

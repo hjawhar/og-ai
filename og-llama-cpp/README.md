@@ -1,16 +1,27 @@
-# llama.cpp installation
+# og-llama-cpp
 
 Everything needed to put a pinned llama.cpp CUDA `llama-server` on this machine, and nothing
-about `og`. The two concerns are separate on purpose: the `og` CLI — installed from npm as
-[`@hjawhar/og-cli`](https://www.npmjs.com/package/@hjawhar/og-cli), source in the parent
-directory — speaks OpenAI-compatible HTTP and does not care who serves it, and this directory
-produces a server that does not know `og` exists. Point `og` at a remote endpoint and none of
-this is needed.
+about `og`. The two concerns are separate directories on purpose: the `og` coding CLI (sibling
+`../og-cli`) speaks OpenAI-compatible HTTP and does not care who serves it, and this
+directory produces a server that does not know `og` exists. Point `og` at a remote endpoint and
+none of this is needed.
 
-| File | Platform | Method |
+One of the two projects in the [`og-ai`](../README.md) repository, alongside
+[`og-cli`](../og-cli). Agent-facing context for both lives in one place,
+[`../AGENTS.md`](../AGENTS.md).
+
+There is no CI here and nothing is published: everything in this directory needs a GPU and
+minutes of wall time, so verification is local — `llama-server --list-devices` after an install,
+and a sweep compared against [`docs/benchmarks.md`](docs/benchmarks.md) after a build bump.
+
+| Path | Platform | Method |
 | --- | --- | --- |
 | `install-engine.sh` | Linux | compiles the pinned tag with CUDA |
 | `install-engine.ps1` | Windows | unzips the prebuilt upstream CUDA release |
+| `tools/bench.ts` | both | raw kernel throughput via `llama-bench` |
+| `tools/profile-sweep.ts` | both | VRAM and serving throughput per candidate profile |
+| `docs/` | — | [measurement record](docs/benchmarks.md), [upgrade drill](docs/upgrading.md), [manual build](docs/building-by-hand.md) |
+| `../AGENTS.md` | — | agent context for this project and `og-cli` both |
 
 Pinned build: **b10488** (commit `9d77fa172`).
 
@@ -168,22 +179,21 @@ OG_LLAMA_BUILD=bNNNNN ./install-engine.sh                    # Linux: rebuilds f
 powershell -ExecutionPolicy Bypass -File .\install-engine.ps1 -Build bNNNNN
 ```
 
-Both re-point `current`, so `og` needs no config change — but check the flags first. Only
-`src/engine/args.ts` builds the argv, and its flag names are verified against a specific build;
-`llama-server --help` after an upgrade is the cheap way to catch a renamed flag before a start
-fails.
+Both re-point `current`, so a client needs no config change — but a new build has to be
+revalidated before it is trusted: kernel and allocator changes move the VRAM spill threshold by
+hundreds of MiB, silently. The full drill (verify, re-measure, roll back, check for renamed
+`llama-server` flags) is [`docs/upgrading.md`](docs/upgrading.md).
 
-Rollback is re-pointing the link at the previous build, which is still on disk:
+## Measuring
 
 ```sh
-ln -sfn ~/.local/llama.cpp/b10488 ~/.local/llama.cpp/current
+bun run tools/bench.ts            # raw kernel ceiling, no KV-cache pressure
+bun run tools/profile-sweep.ts    # VRAM + prefill/generation per serving profile
 ```
 
-```powershell
-Remove-Item -LiteralPath "$env:USERPROFILE\.local\llama.cpp\current" -Recurse -Force
-New-Item -ItemType Junction -Path "$env:USERPROFILE\.local\llama.cpp\current" `
-  -Target "$env:USERPROFILE\.local\llama.cpp\b10488"
-```
+Both are self-contained Bun scripts that drive the installed binaries and import nothing from any
+client. Recorded results, the spill-cliff analysis and the method behind them:
+[`docs/benchmarks.md`](docs/benchmarks.md).
 
 ## Weights
 
@@ -200,7 +210,7 @@ curl -SfL --retry 5 -C - -O \
 Verify the size against the server's `content-length` (17665334432 bytes for that file) — a
 truncated GGUF fails at load with a tensor-count error, not a checksum error.
 
-`og models` then prints every profile with its on-disk state, which is the fastest way to catch a
-filename typo before anything touches the GPU. Operational failure modes of a *running* engine —
-VRAM spill, port conflicts, stale locks, startup timeouts — are in
-[`../docs/runbook.md`](../docs/runbook.md).
+A client's own model listing (`og models`, for the sibling `../og-cli` checkout) is the fastest
+way to catch a filename typo before anything touches the GPU. Operational failure modes of a
+*running* engine — VRAM spill, port conflicts, stale locks, startup timeouts — belong to whoever
+supervises the server; for `og` they are in `../og-cli/docs/runbook.md`.

@@ -157,7 +157,7 @@ async function main(): Promise<number> {
 
 	const bench = path.join(options.binDir, WINDOWS ? "llama-bench.exe" : "llama-bench");
 	if (!(await Bun.file(bench).exists())) {
-		const installer = WINDOWS ? "llama-cpp-installation\\install-engine.ps1" : "llama-cpp-installation/install-engine.sh";
+		const installer = WINDOWS ? ".\\install-engine.ps1" : "./install-engine.sh";
 		console.error(`${path.basename(bench)} not found in ${options.binDir}; run ${installer} first`);
 		return 1;
 	}
