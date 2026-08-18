@@ -1,0 +1,396 @@
+/**
+ * OpenAI-compatible streaming provider. Targets llama.cpp's `--jinja` server
+ * (native tool calls, /health, /tokenize) but degrades cleanly against any other
+ * OpenAI-shaped endpoint.
+ */
+
+import type {
+	ChatRequest,
+	FinishReason,
+	Message,
+	Provider,
+	StreamEvent,
+	ToolCall,
+	ToolSpec,
+} from "./types.ts";
+import { ProviderError } from "./types.ts";
+
+interface WireToolCall {
+	id: string;
+	type: "function";
+	function: { name: string; arguments: string };
+}
+
+interface WireMessage {
+	role: Message["role"];
+	content: string;
+	tool_calls?: WireToolCall[];
+	tool_call_id?: string;
+	name?: string;
+}
+
+/** Accumulator for a tool call arriving as indexed deltas. */
+interface PendingCall {
+	id: string;
+	name: string;
+	args: string;
+}
+
+const RETRYABLE_STATUS: Record<number, true> = {
+	408: true,
+	409: true,
+	425: true,
+	429: true,
+	500: true,
+	502: true,
+	503: true,
+	504: true,
+	529: true,
+};
+
+/** Strips internal-only fields and reshapes tool metadata into wire format. */
+function toWire(msg: Message): WireMessage {
+	const wire: WireMessage = { role: msg.role, content: msg.content };
+	if (msg.role === "tool") {
+		if (msg.toolCallId !== undefined) wire.tool_call_id = msg.toolCallId;
+		if (msg.name !== undefined) wire.name = msg.name;
+		return wire;
+	}
+	if (msg.toolCalls && msg.toolCalls.length > 0) {
+		wire.tool_calls = msg.toolCalls.map((call) => ({
+			id: call.id,
+			type: "function",
+			function: { name: call.name, arguments: call.arguments },
+		}));
+	}
+	return wire;
+}
+
+function mapFinishReason(raw: string | null | undefined, sawToolCalls: boolean): FinishReason {
+	if (raw === "tool_calls" || raw === "function_call") return "tool_calls";
+	if (raw === "length" || raw === "max_tokens") return "length";
+	if (sawToolCalls && (raw === null || raw === undefined)) return "tool_calls";
+	return "stop";
+}
+
+function isAbort(err: unknown, signal: AbortSignal | undefined): boolean {
+	if (signal?.aborted) return true;
+	if (typeof err !== "object" || err === null || !("name" in err)) return false;
+	return err.name === "AbortError" || err.name === "TimeoutError";
+}
+
+function readNumber(source: Record<string, unknown>, key: string): number {
+	const value = source[key];
+	return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+	return value as Record<string, unknown>;
+}
+
+export class OpenAIProvider implements Provider {
+	readonly id: string;
+	readonly model: string;
+	readonly contextWindow: number;
+	readonly nativeToolCalls: boolean;
+
+	private readonly endpoint: string;
+	private readonly apiKey: string | undefined;
+	/** Flipped off permanently once /tokenize proves unavailable. */
+	private tokenizerAvailable = true;
+
+	constructor(opts: {
+		endpoint: string;
+		model: string;
+		apiKey?: string;
+		contextWindow: number;
+		nativeToolCalls?: boolean;
+		id: string;
+	}) {
+		this.endpoint = opts.endpoint.replace(/\/+$/, "");
+		this.model = opts.model;
+		this.apiKey = opts.apiKey;
+		this.contextWindow = opts.contextWindow;
+		this.nativeToolCalls = opts.nativeToolCalls ?? true;
+		this.id = opts.id;
+	}
+
+	private headers(): Record<string, string> {
+		const headers: Record<string, string> = { "content-type": "application/json" };
+		if (this.apiKey) headers["authorization"] = `Bearer ${this.apiKey}`;
+		return headers;
+	}
+
+	async *chat(req: ChatRequest): AsyncGenerator<StreamEvent, void, undefined> {
+		const signal = req.signal;
+		if (signal?.aborted) {
+			yield { type: "done", finishReason: "aborted" };
+			return;
+		}
+
+		const body: Record<string, unknown> = {
+			model: this.model,
+			messages: req.messages.map(toWire),
+			stream: true,
+			stream_options: { include_usage: true },
+		};
+		if (req.tools && req.tools.length > 0) body["tools"] = req.tools.map(specToWire);
+		if (req.temperature !== undefined) body["temperature"] = req.temperature;
+		if (req.maxTokens !== undefined) body["max_tokens"] = req.maxTokens;
+		if (req.stop && req.stop.length > 0) body["stop"] = req.stop;
+
+		let res: Response;
+		try {
+			res = await fetch(`${this.endpoint}/v1/chat/completions`, {
+				method: "POST",
+				headers: this.headers(),
+				body: JSON.stringify(body),
+				...(signal ? { signal } : {}),
+			});
+		} catch (err) {
+			if (isAbort(err, signal)) {
+				yield { type: "done", finishReason: "aborted" };
+				return;
+			}
+			const detail = err instanceof Error ? err.message : String(err);
+			throw new ProviderError(`cannot reach ${this.endpoint}: ${detail}`, undefined, true);
+		}
+
+		if (!res.ok) {
+			let detail = "";
+			try {
+				detail = (await res.text()).slice(0, 2000);
+			} catch {
+				detail = "";
+			}
+			throw new ProviderError(
+				`chat completion failed: HTTP ${res.status} ${res.statusText}${detail ? ` — ${detail}` : ""}`,
+				res.status,
+				RETRYABLE_STATUS[res.status] === true,
+			);
+		}
+		if (!res.body) {
+			throw new ProviderError("chat completion response had no body", res.status, true);
+		}
+
+		const pending = new Map<number, PendingCall>();
+		const order: number[] = [];
+		let openIndex: number | undefined;
+		let malformed: string | undefined;
+		let sawToolCalls = false;
+		let usage: { promptTokens: number; completionTokens: number } | undefined;
+		let rawFinish: string | null | undefined;
+		let streamEnded = false;
+
+		/** Emits a completed call, or records the first malformed-arguments failure. */
+		const flush = (index: number): StreamEvent | undefined => {
+			const call = pending.get(index);
+			pending.delete(index);
+			if (!call) return undefined;
+			const args = call.args.trim() === "" ? "{}" : call.args;
+			try {
+				JSON.parse(args);
+			} catch (err) {
+				malformed ??= `tool call ${call.name || `#${index}`} produced unparseable arguments (${
+					err instanceof Error ? err.message : String(err)
+				}): ${args.slice(0, 500)}`;
+				return undefined;
+			}
+			sawToolCalls = true;
+			const complete: ToolCall = { id: call.id || `call_${index}`, name: call.name, arguments: args };
+			return { type: "tool_call", call: complete };
+		};
+
+		const reader = res.body.getReader();
+		const decoder = new TextDecoder();
+		let buffer = "";
+
+		try {
+			while (!streamEnded) {
+				let finished = false;
+				try {
+					const chunk = await reader.read();
+					finished = chunk.done;
+					if (chunk.value) buffer += decoder.decode(chunk.value, { stream: true });
+				} catch (err) {
+					if (isAbort(err, signal)) {
+						yield { type: "done", finishReason: "aborted" };
+						return;
+					}
+					const detail = err instanceof Error ? err.message : String(err);
+					throw new ProviderError(`stream read failed: ${detail}`, undefined, true);
+				}
+				if (finished) {
+					// Flush the decoder and terminate a trailing block that lacked its blank line.
+					buffer += `${decoder.decode()}\n\n`;
+				}
+
+				let cut = buffer.indexOf("\n\n");
+				while (cut !== -1) {
+					const block = buffer.slice(0, cut);
+					buffer = buffer.slice(cut + 2);
+					cut = buffer.indexOf("\n\n");
+
+					const payload = sseData(block);
+					if (payload === undefined) continue;
+					if (payload === "[DONE]") {
+						// Terminal marker: anything a proxy appends after it is not ours to emit.
+						streamEnded = true;
+						break;
+					}
+					let parsed: unknown;
+					try {
+						parsed = JSON.parse(payload);
+					} catch {
+						// Keep-alives and non-JSON noise are not fatal.
+						continue;
+					}
+					const frame = asRecord(parsed);
+					if (!frame) continue;
+
+					const frameUsage = asRecord(frame["usage"]);
+					if (frameUsage) {
+						usage = {
+							promptTokens: readNumber(frameUsage, "prompt_tokens"),
+							completionTokens: readNumber(frameUsage, "completion_tokens"),
+						};
+					}
+
+					const choices = frame["choices"];
+					const choice = Array.isArray(choices) ? asRecord(choices[0]) : undefined;
+					if (!choice) continue;
+					const finish = choice["finish_reason"];
+					if (typeof finish === "string") rawFinish = finish;
+					const delta = asRecord(choice["delta"]) ?? asRecord(choice["message"]);
+					if (!delta) continue;
+
+					const reasoning = delta["reasoning_content"] ?? delta["reasoning"];
+					if (typeof reasoning === "string" && reasoning.length > 0) {
+						yield { type: "reasoning", delta: reasoning };
+					}
+					const content = delta["content"];
+					if (typeof content === "string" && content.length > 0) {
+						yield { type: "text", delta: content };
+					}
+
+					const deltaCalls = delta["tool_calls"];
+					if (!Array.isArray(deltaCalls)) continue;
+					for (let i = 0; i < deltaCalls.length; i++) {
+						const raw = asRecord(deltaCalls[i]);
+						if (!raw) continue;
+						const rawIndex = raw["index"];
+						const index = typeof rawIndex === "number" ? rawIndex : (openIndex ?? order.length);
+						if (openIndex !== undefined && openIndex !== index) {
+							// A new index supersedes the previous call: it can no longer grow.
+							const event = flush(openIndex);
+							if (event) yield event;
+						}
+						openIndex = index;
+						let entry = pending.get(index);
+						if (!entry) {
+							entry = { id: "", name: "", args: "" };
+							pending.set(index, entry);
+							order.push(index);
+						}
+						const id = raw["id"];
+						if (typeof id === "string" && id.length > 0) entry.id = id;
+						const fn = asRecord(raw["function"]);
+						if (!fn) continue;
+						const name = fn["name"];
+						if (typeof name === "string" && name.length > 0) entry.name = name;
+						const args = fn["arguments"];
+						if (typeof args === "string") entry.args += args;
+					}
+				}
+
+				if (finished) break;
+			}
+		} finally {
+			reader.releaseLock();
+		}
+
+		for (const index of order) {
+			const event = flush(index);
+			if (event) yield event;
+		}
+
+		if (signal?.aborted) {
+			yield { type: "done", finishReason: "aborted" };
+			return;
+		}
+		if (usage) {
+			yield { type: "usage", promptTokens: usage.promptTokens, completionTokens: usage.completionTokens };
+		}
+		if (malformed !== undefined) {
+			yield { type: "done", finishReason: "error", error: malformed };
+			return;
+		}
+		yield { type: "done", finishReason: mapFinishReason(rawFinish, sawToolCalls) };
+	}
+
+	async countTokens(text: string): Promise<number> {
+		if (this.tokenizerAvailable) {
+			try {
+				const res = await fetch(`${this.endpoint}/tokenize`, {
+					method: "POST",
+					headers: this.headers(),
+					body: JSON.stringify({ content: text }),
+				});
+				if (res.ok) {
+					const frame = asRecord(await res.json());
+					const tokens = frame?.["tokens"];
+					if (Array.isArray(tokens)) return tokens.length;
+				}
+				this.tokenizerAvailable = false;
+			} catch {
+				this.tokenizerAvailable = false;
+			}
+		}
+		return Math.ceil(text.length / 3.6);
+	}
+
+	async health(): Promise<boolean> {
+		try {
+			const res = await fetch(`${this.endpoint}/health`, { headers: this.headers() });
+			if (res.ok) {
+				const frame = asRecord(await res.json());
+				if (frame?.["status"] === "ok") return true;
+			}
+		} catch {
+			// Fall through to the generic OpenAI probe.
+		}
+		try {
+			const res = await fetch(`${this.endpoint}/v1/models`, { headers: this.headers() });
+			return res.status === 200;
+		} catch {
+			return false;
+		}
+	}
+}
+
+function specToWire(spec: ToolSpec): Record<string, unknown> {
+	return {
+		type: "function",
+		function: { name: spec.name, description: spec.description, parameters: spec.parameters },
+	};
+}
+
+/**
+ * Extracts the `data:` payload of one SSE block, joining multi-line data fields
+ * and ignoring comments, keep-alives and non-data fields. Returns undefined when
+ * the block carries no data.
+ */
+function sseData(block: string): string | undefined {
+	const parts: string[] = [];
+	for (const rawLine of block.split("\n")) {
+		const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+		if (line.length === 0 || line.startsWith(":")) continue;
+		if (!line.startsWith("data:")) continue;
+		const value = line.slice(5);
+		parts.push(value.startsWith(" ") ? value.slice(1) : value);
+	}
+	if (parts.length === 0) return undefined;
+	const joined = parts.join("\n");
+	return joined.trim() === "[DONE]" ? "[DONE]" : joined;
+}

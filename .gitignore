@@ -1,0 +1,25 @@
+# dependencies (bun.lock IS committed on purpose — reproducible installs)
+node_modules/
+
+# compiled binary from `bun run build`
+dist/
+
+# logs
+*.log
+
+# per-workspace og state (config override is committed deliberately if wanted,
+# but sessions.db / engine.json / engine.log / history never are)
+.og/
+
+# test + coverage output
+coverage/
+*.lcov
+
+# model weights: never commit multi-GiB GGUFs
+*.gguf
+
+# OS cruft
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
