@@ -65,11 +65,14 @@ Something else runs the server; `og` dials it and streams.
 
 ## Layout
 
-- `src/config/` — `schema.ts` (types + `ConfigError`), `load.ts` (`DEFAULT_CONFIG`,
-  `loadConfig`, `modelSpecOf`). Layering: defaults <- `~/.og/config.json` <-
-  `<ws>/.og/config.json` <- `OG_*` env <- CLI overrides. Objects merge, arrays replace. A `model`
-  that is not a key of `models` is synthesised into one, so `-m <any-name>` works with no config
-  file at all.
+- `src/config/` — `schema.ts` (types + `ConfigError`), `load.ts` (`DEFAULT_CONFIG`, `loadConfig`,
+  `modelSpecOf`, `resolveActiveModel`, `modelIsPinned`). Layering: defaults <- `~/.og/config.json` <-
+  `<ws>/.og/config.json` <- `OG_*` env <- CLI overrides. Objects merge, arrays replace. **No models
+  ship**: `models` is `{}`, `model` is `""`, and the active one is discovered from the endpoint
+  unless pinned. A `model` that is not a key of `models` is synthesised into one, so `-m <any-name>`
+  works with no config file at all.
+- `src/util/weights.ts` — lists `.gguf` files in `modelsDir` so `og models` can show what is on this
+  machine. Shown, never acted on: og starts no server.
 - `src/provider/` — **the only code in the tree that opens a socket.** `openai.ts` streaming SSE
   client plus the `health()` preflight (`ProviderError`: retryable on 408/429/5xx + transport);
   `registry.ts` `createProvider` resolves wire model id, endpoint, bearer token and extra headers
@@ -164,12 +167,16 @@ directory. Server lifecycle lives here and only here.
 - `ui/` — the browser front door, and the one npm workspace in the repository. `ui/src/` is an
   Angular + TailwindCSS app (SCSS component styles); `ui/server/main.ts` is the Bun process that
   serves the built bundle from `ui/dist/ui/browser` on `127.0.0.1:8130` alongside a polled JSON API
-  (`GET /api/state?ctx=`, `POST /api/download`, `POST /api/download/cancel`, `POST /api/serve`,
-  `POST /api/server/stop`). An unbuilt UI answers `503` on the page and keeps `/api/*` working.
-  It reports hardware, installed weights, the download catalogue and a fit verdict per model,
-  reads GGUF metadata directly to size a KV cache, and launches models by spawning `serve.ts`
-  rather than composing an argv. `ui/server/compute.ts` is the peak FLOPS/TOPS table — the one
-  place holding numbers nobody measured here, and the only file allowed to.
+  (`GET /api/state?ctx=`, `GET /api/hub/browse`, `GET /api/hub/inspect`, `POST /api/download`,
+  `POST /api/download/cancel`, `POST /api/serve`, `POST /api/server/stop`). An unbuilt UI answers
+  `503` on the page and keeps `/api/*` working. It reports hardware, installed weights and a fit
+  verdict per model, reads GGUF metadata directly to size a KV cache, and launches models by
+  spawning `serve.ts` rather than composing an argv.
+  There is **no curated model list**: `ui/server/hub.ts` browses Hugging Face, and its presets are
+  Hub queries (tags plus a sort) rather than names of models. `ui/server/catalog.ts` holds only
+  `MEASURED`, the verbatim rows of `docs/benchmarks.md` §4. `ui/server/compute.ts` is the peak
+  FLOPS/TOPS table — the one place holding numbers nobody measured here, and the only file allowed
+  to.
 - `tools/bench.ts` — raw kernel ceiling via `llama-bench` (pp/tg, no KV-cache pressure).
 - `tools/profile-sweep.ts` — starts `llama-server` per case, samples VRAM, measures prefill and
   generation throughput, tears it down.
@@ -183,8 +190,12 @@ to every `.so`/`.dll` it loads, plus a `current` symlink (junction on Windows) p
 That flatness is the contract — `serve.ts` spawns `<binDir>/llama-server` with a bare argv,
 no `LD_LIBRARY_PATH` and no environment fixup, so the server must find its own libraries. Only the
 installers write under `$OG_LLAMA_ROOT`; `serve.ts`, `tools/**` and `ui/server/**` only read from
-it. The one other writer is the UI's downloader, and it writes weights into the models directory,
-never the engine root.
+it. Two files write into the **models directory** and nowhere else: `ui/server/downloads.ts`
+(weights in, via a `.part` file renamed on completion) and `ui/server/weights.ts` (weights out).
+`weights.ts` is the only destructive path in the repository: it requires a bare `.gguf` basename,
+resolves it against the models directory and refuses anything that lands outside, and removes a
+`gguf-split` set together — deleting one shard of three frees nothing and breaks a model that still
+looks installed.
 
 **The serving argv is built in exactly one place: `serve.ts`.** Its flags are verified
 against the pinned build's `llama-server --help`, and it is the only file in the repository an
@@ -253,23 +264,47 @@ and a re-run of the sweep compared against `docs/benchmarks.md`.
 
 `og-cli` works against **any** OpenAI-compatible endpoint: a local `llama-server`, a hosted API, a
 gateway, someone else's GPU box. `og-llama-cpp` is one *optional* way to provide one — the good way
-on an NVIDIA box, and the one every measured number in this repository comes from — not a
-dependency. Delete either directory and the other still builds and runs.
+on an NVIDIA box, and the one every measured number in this repository comes from. Neither imports
+the other: delete either directory and the other still builds, typechecks and runs its tests.
 
-One coupling survives. It is documentary, and it has exactly one direction:
+But "no import" is not "no effect". In everyday use `og-cli` is pointed at a server `og-llama-cpp`
+started, and everything that crosses the boundary crosses it as HTTP or as a filename. The rule that
+keeps them honest is **`og-cli` hardcodes nothing about a model — it discovers everything**:
 
-**Context windows.** `contextWindow` is the only per-model number `og-cli` carries, and each value
-in `og-cli/src/config/load.ts` is copied from `og-llama-cpp/docs/benchmarks.md` — a window the
-reference server was actually measured serving at a safe VRAM headroom. Changing one in `og-cli`
-without a re-run in `og-llama-cpp` makes the record a lie. Nothing else about the model crosses the
-line: `og-cli` has no idea what a GGUF, an offload split or a KV cache quantisation is.
+- **the model id** from `GET /v1/models`, which is the only authority on what a request can reach;
+- **the context window** from that same reply's `meta.n_ctx`, so the number og budgets against is
+  the one the server actually allocated;
+- **what is installed** by listing `.gguf` files in `modelsDir` (`OG_MODELS_DIR`, the same variable
+  og-llama-cpp uses), shown but never acted on, because og starts no server.
 
-Two former couplings are now purely `og-llama-cpp` concerns, with no counterpart in `og-cli`:
+No model names, windows or sampling recipes ship in `og-cli`. `DEFAULT_CONFIG.models` is `{}` and
+`model` is `""`. A table of names there could only be a guess about somebody else's machine, and a
+wrong guess is not inert: a `llama-server` answers a request for a model it does not have with
+whatever it *does* have, so og would receive the loaded model's output budgeted from the wrong entry,
+silently. Adding a shipped entry back is a regression, not a convenience.
+
+**Assume a change to either side can still strand the other. Before finishing work in one, re-check
+these three against the other:**
+
+1. **The model id.** `serve.ts` names the served model with `--alias`, defaulting to the weights
+   filename without `.gguf`, and that string is what `/v1/models` reports — what `og models` lists,
+   what a config entry is matched against, and what `og` sends. Unpinned, og follows it
+   (`resolveActiveModel`); a *pinned* name is obeyed verbatim, so renaming weights or changing the
+   alias default silently stops a pinned entry matching.
+2. **The endpoint.** `og-cli`'s default `endpoint` and `serve.ts`'s default `--port` are both
+   `127.0.0.1:8127`, decided independently in two projects. Moving one moves nothing else.
+3. **Weights coming and going.** The UI downloads and deletes files (`ui/server/downloads.ts`,
+   `ui/server/weights.ts`) that `og-cli` lists as `on disk, not loaded` and that a pinned entry may
+   name. og reads that directory and nothing more — it cannot load a file, so "installed" is shown,
+   never acted on.
+
+Two couplings are now purely `og-llama-cpp` concerns, with no counterpart in `og-cli`:
 
 - **`llama-server` flag names.** `serve.ts` builds the argv; bumping the pinned build means
   re-checking those flags there — see `og-llama-cpp/docs/upgrading.md`.
 - **The install-directory shape.** The flat `<root>/<build>/` layout is a contract between the two
   installers and `serve.ts`, all three inside `og-llama-cpp`.
 
-Working on both at once: make the engine-side change and re-measure first, then update `og-cli`'s
-context windows against the new record. Never the other way round.
+Working on both at once: make the engine-side change and re-measure first, then update `og-cli`
+against the new record. Never the other way round — a number in `og-cli` that no run produced is
+the one failure mode this repository exists to avoid.

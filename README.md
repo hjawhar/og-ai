@@ -16,7 +16,7 @@ og-ai/
 | Project | What it gives you | Start at |
 | --- | --- | --- |
 | [`og-cli/`](og-cli/) | `og` on your `PATH`: an agent loop, seven sandboxed tools, a SQLite session store, and two front-ends | [`og-cli/README.md`](og-cli/README.md) |
-| [`og-llama-cpp/`](og-llama-cpp/) | `llama-server` in `~/.local/llama.cpp/current`, built or unzipped from one pinned llama.cpp tag, plus `serve.ts` to run it and a browser UI to pick the weights that fit | [`og-llama-cpp/README.md`](og-llama-cpp/README.md) |
+| [`og-llama-cpp/`](og-llama-cpp/) | `llama-server` in `~/.local/llama.cpp/current`, built or unzipped from one pinned llama.cpp tag, plus `serve.ts` to run it and a [browser UI](#the-model-ui) that browses Hugging Face and sizes every candidate against your card | [`og-llama-cpp/README.md`](og-llama-cpp/README.md) |
 
 ## Why two projects
 
@@ -56,8 +56,39 @@ That is why the serving side of this repository ships *measured* operating point
 sliders: each one is a real run on the reference box, sized to leave VRAM headroom that a browser
 opening cannot eat. The measurements, the spill-cliff analysis and the fix ladder all live with the
 GPU, in [`og-llama-cpp/docs/benchmarks.md`](og-llama-cpp/docs/benchmarks.md) §5. `og-cli` inherits
-exactly one number from that record — the context window it budgets against — and diagnoses nothing
-about the GPU, because a client cannot see one.
+no numbers from that record at all: it asks the endpoint which model is loaded and what context
+length it allocated, and diagnoses nothing about the GPU, because a client cannot see one.
+
+## The model UI
+
+`bun run ui` in [`og-llama-cpp/`](og-llama-cpp/) serves the whole picture on `http://127.0.0.1:8130`
+— one Bun process, the JSON API and the built Angular app together, loopback only.
+
+![The model UI: server state, GPU budget, and the weights installed on this machine](og-llama-cpp/docs/images/model-ui.png)
+
+Every verdict is arithmetic shown in full, against a budget that is total VRAM minus real headroom.
+A row marked **measured** is a run from `docs/benchmarks.md` and beats every estimate beside it. The
+file the running server has open cannot be deleted, and the row says why.
+
+![Browsing Hugging Face: presets, filters, and the file to take on this card](og-llama-cpp/docs/images/model-ui-browse.png)
+
+There is no curated model list. **Presets are Hub queries** — tags plus a sort — and each states the
+query it ran, so nothing has to be taken on faith. **Filters** narrow on this machine's terms: only
+what runs on the GPU, only what fits entirely, a size ceiling, open licences. Each repository arrives
+with its GGUF files already sized and one marked as the one to take here.
+
+![Inspect: the real GGUF header, read over a range request before downloading](og-llama-cpp/docs/images/model-ui-inspect.png)
+
+**Inspect** is the interesting one. A file still on the Hub can only be judged by its size, so
+Inspect fetches 4 MiB of a 13 GiB file, reads its actual GGUF header, and answers exactly: here, 595
+MiB of KV cache at ctx 32768, 49 layers, 128 experts, and the one expert layer that has to move to
+the CPU — `--n-cpu-moe 1` — before a byte of the download is spent.
+
+![Deleting weights, behind a confirmation that names the files and the space](og-llama-cpp/docs/images/model-ui-delete.png)
+
+Removal is the only destructive thing the server does, so it is narrow: a bare `.gguf` basename
+resolved inside the models directory, split weights removed as a set, and a file the server holds
+open refused with the reason rather than an OS error.
 
 ## Quickstart
 
@@ -91,9 +122,9 @@ mkdir -p ~/models && curl -SfL --retry 5 -C - -o \
   https://huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/resolve/main/Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL.gguf
 ```
 
-Picking weights in a browser instead: `bun run ui` in `og-llama-cpp/` is the front door on
-`http://127.0.0.1:8130` — what is installed, what can be downloaded, what actually fits this card —
-and it launches the chosen model for you.
+Picking weights in a browser instead: [`bun run ui`](#the-model-ui) browses Hugging Face, sizes every
+candidate against this card, downloads the one you choose, and launches it — no filename typing and
+no guessing.
 
 Then **two terminals**. The server runs in the foreground; Ctrl-C there frees the card:
 
@@ -105,7 +136,7 @@ cd og-ai/og-llama-cpp && bun run serve.ts
 
 ```sh
 # terminal 2 — the client
-og models          # what is configured, and where each model's requests go. Needs no server
+og models          # what the endpoint serves, plus the weights on this machine. Needs no server
 og                 # interactive TUI
 ```
 
