@@ -15,16 +15,18 @@
  *
  * Usage: bun run ui/server/main.ts [--port 8130] [--open]
  */
-import { readdirSync, statSync } from "node:fs";
+import { existsSync, readdirSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { CATALOG, measuredNote } from "./catalog.ts";
+import { measuredNote } from "./catalog.ts";
 import * as downloads from "./downloads.ts";
-import { fitFor, HEADROOM_MIB, type Fit, type Gpu } from "./fit.ts";
+import { bestFitting, fitFor, HEADROOM_MIB, type Fit, type Gpu } from "./fit.ts";
 import { readGguf, type GgufInfo } from "./gguf.ts";
+import * as hub from "./hub.ts";
 import { hardwareOf, isRecord, probeServer, readEngine, readGpus, type EngineInfo, type Hardware, type ServedModel } from "./hardware.ts";
 import * as launcher from "./launcher.ts";
+import { remove, shardsOf, WeightsError } from "./weights.ts";
 
 const WIN = process.platform === "win32";
 const HOME = os.homedir();
@@ -34,6 +36,7 @@ const UI_ROOT = path.resolve(import.meta.dir, "..");
 const DIST = path.join(UI_ROOT, "dist", "ui", "browser");
 const SERVE_SCRIPT = path.join(PROJECT_ROOT, "serve.ts");
 const DEFAULT_CTX = 32768;
+const MIB = 1024 * 1024;
 
 interface Options {
 	host: string;
@@ -73,6 +76,10 @@ Build the page first: cd ui && npm run build (or bun run ui:build from the
 project root). Downloads land as <name>.gguf.part and are renamed on completion,
 so an interrupted transfer never looks like usable weights. Ctrl-C stops the UI,
 any download it started, and any llama-server it launched.
+
+Searching Hugging Face needs no credentials, but a gated repository (Google's own
+Gemma weights, Meta's Llama) answers 401 until its licence is accepted and a
+token is in this process's environment as HF_TOKEN or HUGGING_FACE_HUB_TOKEN.
 
 Loopback and unauthenticated by design: it can spawn processes and write files.`;
 
@@ -137,21 +144,50 @@ interface InstalledModel {
 	moe: boolean;
 	fit: Fit;
 	measured?: string;
-	catalogKey?: string;
 	/**
-	 * Set when the file is shorter than the catalogued content-length — a download
-	 * in flight, or a transfer that died. Serving it would fail minutes into
+	 * Why this file must not be served yet. `downloading` means a `.part` sibling
+	 * sits beside it; `short` means the file's own tensor table needs more bytes
+	 * than the file has, which is a transfer that died. Both are read from the
+	 * filesystem and the file's own header — there is no catalogued size to
+	 * compare against any more, and a GGUF that is short fails minutes into
 	 * loading with a tensor-count error.
 	 */
-	incomplete?: { haveBytes: number; expectBytes: number };
+	incomplete?: { reason: "downloading" | "short"; haveBytes: number; expectBytes?: number };
+	/**
+	 * Every file that removing this one takes with it. `[file]` for an ordinary
+	 * model; a whole `gguf-split` set otherwise, because llama.cpp opens shard 1
+	 * and expects its siblings, so removing one shard breaks a model rather than
+	 * freeing it.
+	 */
+	shards: string[];
+	/**
+	 * Why this file cannot be deleted right now, as a sentence to show. Absent
+	 * when it can. Decided here rather than in the browser: the obstacles are a
+	 * running server holding the file mapped and a transfer about to rename over
+	 * it, and only this process knows both.
+	 */
+	blocked?: string;
 }
 
 interface StateResponse {
 	hardware: Hardware;
 	engine: EngineInfo;
-	server: { url: string; reachable: boolean; models: ServedModel[]; launchedHere: boolean; launching: boolean; pid?: number; log: string[] };
+	server: {
+		url: string;
+		reachable: boolean;
+		models: ServedModel[];
+		launchedHere: boolean;
+		launching: boolean;
+		pid?: number;
+		/** Weights this process launched, when it launched any. */
+		file?: string;
+		log: string[];
+	};
 	installed: InstalledModel[];
-	catalog: (Omit<(typeof CATALOG)[number], never> & { installed: boolean; fit: Fit; download?: downloads.DownloadView })[];
+	/** Every download this process knows about, keyed the way it was started. */
+	downloads: Record<string, downloads.DownloadView>;
+	/** Whether a gated Hugging Face repository could be fetched at all. */
+	hubTokenPresent: boolean;
 	modelsDir: string;
 	ctx: number;
 }
@@ -184,7 +220,17 @@ function listGgufs(dir: string): string[] {
 	}
 }
 
-function installedModels(modelsDir: string, ctx: number, gpu: Gpu | undefined, ramFreeMiB: number): InstalledModel[] {
+/**
+ * Filenames compared the way the filesystem compares them. NTFS is
+ * case-insensitive, so `qwen2.5-coder-0.5b-instruct-q4_k_m.gguf` and
+ * `Qwen2.5-Coder-0.5B-Instruct-Q4_K_M.gguf` are one file; treating them as two
+ * reports installed weights as missing and offers a download over them.
+ */
+function fold(name: string): string {
+	return WIN ? name.toLowerCase() : name;
+}
+
+function installedModels(modelsDir: string, ctx: number, gpu: Gpu | undefined, ramFreeMiB: number, held: HeldWeights): InstalledModel[] {
 	const models: InstalledModel[] = [];
 	for (const file of listGgufs(modelsDir)) {
 		const full = path.join(modelsDir, file);
@@ -196,16 +242,13 @@ function installedModels(modelsDir: string, ctx: number, gpu: Gpu | undefined, r
 		}
 		const info = inspect(full);
 		const moe = (info?.expertCount ?? 0) > 0 || (info?.expertBytes ?? 0) > 0;
-		const entry = CATALOG.find((candidate) => candidate.file === file);
-		// Fit is answered for the finished file: a verdict that changes the moment a
-		// download completes would be worse than useless.
-		const expectBytes = entry?.sizeBytes ?? sizeBytes;
 		const model: InstalledModel = {
 			file,
 			path: full,
 			sizeBytes,
 			moe,
-			fit: fitFor({ file, sizeBytes: expectBytes, info, moe, ctx, gpu, ramFreeMiB }),
+			fit: fitFor({ file, sizeBytes, info, moe, ctx, gpu, ramFreeMiB }),
+			shards: shardsOf(file),
 		};
 		if (info?.arch !== undefined) model.arch = info.arch;
 		if (info?.blockCount !== undefined) model.layers = info.blockCount;
@@ -213,33 +256,68 @@ function installedModels(modelsDir: string, ctx: number, gpu: Gpu | undefined, r
 		if (info?.expertCount !== undefined) model.experts = info.expertCount;
 		const measured = measuredNote(file);
 		if (measured !== undefined) model.measured = measured;
-		if (entry !== undefined) {
-			model.catalogKey = entry.key;
-			if (sizeBytes < entry.sizeBytes) model.incomplete = { haveBytes: sizeBytes, expectBytes: entry.sizeBytes };
-		}
+		const incomplete = incompleteness(full, sizeBytes, info);
+		if (incomplete !== undefined) model.incomplete = incomplete;
+		const blocked = blockedReason(file, held);
+		if (blocked !== undefined) model.blocked = blocked;
 		models.push(model);
 	}
 	return models;
+}
+
+/**
+ * Whether a file on disk is not yet servable, answered from the file rather than
+ * from a catalogued byte count: a `.part` sibling means a transfer is running,
+ * and a tensor table that needs more bytes than the file holds means one died.
+ * The second test is one-directional — it proves short, never proves complete —
+ * which is the honest shape for this, since only the header is read.
+ */
+function incompleteness(full: string, sizeBytes: number, info: GgufInfo | undefined): InstalledModel["incomplete"] {
+	if (existsSync(`${full}.part`)) return { reason: "downloading", haveBytes: sizeBytes };
+	if (info !== undefined && info.tensorBytes > sizeBytes) {
+		return { reason: "short", haveBytes: sizeBytes, expectBytes: Math.round(info.tensorBytes) };
+	}
+	return undefined;
+}
+
+/** What a running server and an in-flight transfer are holding, for one snapshot. */
+interface HeldWeights {
+	/** Weights this process launched, when it launched any. */
+	launched: string | null;
+	/** Model ids the server names, which serve.ts aliases from the filename. */
+	servedIds: string[];
+}
+
+/**
+ * Why a file cannot be deleted, as the sentence the page shows. Two obstacles,
+ * both real: a running llama-server holds its weights mapped, which on Windows
+ * makes the file undeletable and everywhere makes deleting it a way to break a
+ * live server; and a transfer in flight would rename over the name seconds later.
+ *
+ * The served-id comparison is the fallback for a server this process did not
+ * start: serve.ts aliases a model to its filename without the extension, so that
+ * is what the server reports.
+ */
+function blockedReason(file: string, held: HeldWeights): string | undefined {
+	if (downloads.isArriving(file)) return "a download is writing this file — cancel it first";
+	const shards = shardsOf(file).map(fold);
+	if (held.launched !== null && shards.includes(fold(held.launched))) {
+		return "the server started here has this file open — stop the server first";
+	}
+	const stem = fold(file.replace(/\.gguf$/i, ""));
+	if (held.servedIds.some((id) => fold(id) === stem)) {
+		return "the running server is serving this file — stop it first";
+	}
+	return undefined;
 }
 
 async function snapshot(options: Options, ctx: number): Promise<StateResponse> {
 	const [gpus, engine, probe] = await Promise.all([readGpus(), readEngine(options.root), probeServer(options.serverPort)]);
 	const hardware = hardwareOf(gpus, HEADROOM_MIB);
 	const gpu = gpus[0];
-	const installed = installedModels(options.modelsDir, ctx, gpu, hardware.ramFreeMiB);
 	const launched = launcher.status();
-
-	const catalog = CATALOG.map((entry) => {
-		const local = installed.find((model) => model.file === entry.file);
-		const fit = local?.fit ?? fitFor({ file: entry.file, sizeBytes: entry.sizeBytes, moe: entry.moe, ctx, gpu, ramFreeMiB: hardware.ramFreeMiB });
-		const download = downloads.viewOf(entry.key);
-		return {
-			...entry,
-			installed: local !== undefined && local.incomplete === undefined,
-			fit,
-			...(download === undefined ? {} : { download }),
-		};
-	});
+	const held: HeldWeights = { launched: launched.file, servedIds: probe.models.map((model) => model.id) };
+	const installed = installedModels(options.modelsDir, ctx, gpu, hardware.ramFreeMiB, held);
 
 	return {
 		hardware,
@@ -254,13 +332,50 @@ async function snapshot(options: Options, ctx: number): Promise<StateResponse> {
 			// names a model, it is still loading.
 			launching: launched.pid !== null && probe.models.length === 0,
 			...(launched.pid === null ? {} : { pid: launched.pid }),
+			...(launched.file === null ? {} : { file: launched.file }),
 			log: launched.log,
 		},
 		installed,
-		catalog,
+		downloads: downloads.all(),
+		hubTokenPresent: hub.hubToken() !== undefined,
 		modelsDir: options.modelsDir,
 		ctx,
 	};
+}
+
+type FitFilter = "any" | "runs" | "gpu";
+type GatedFilter = "any" | "open";
+
+function fitFilterOf(raw: string | null): FitFilter {
+	if (raw === null || raw.length === 0 || raw === "any") return "any";
+	if (raw === "runs" || raw === "gpu") return raw;
+	throw new hub.HubError(`unknown fit '${raw}'; expected any, runs or gpu`, 400);
+}
+
+function gatedFilterOf(raw: string | null): GatedFilter {
+	if (raw === null || raw.length === 0 || raw === "any") return "any";
+	if (raw === "open") return "open";
+	throw new hub.HubError(`unknown gated '${raw}'; expected any or open`, 400);
+}
+
+function ctxOf(url: URL): number {
+	const raw = Number.parseInt(url.searchParams.get("ctx") ?? "", 10);
+	return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_CTX;
+}
+
+/**
+ * The two hardware facts a fit verdict needs, without the rest of a snapshot's
+ * work: a Hub question does not need to probe llama-server or read the models dir.
+ */
+async function fitEnvironment(): Promise<{ gpu: Gpu | undefined; ramFreeMiB: number }> {
+	const gpus = await readGpus();
+	return { gpu: gpus[0], ramFreeMiB: hardwareOf(gpus, HEADROOM_MIB).ramFreeMiB };
+}
+
+/** Hub failures carry the status the operator should see; nothing else becomes a 502. */
+function hubFailure(error: unknown): Response {
+	if (error instanceof hub.HubError) return new Response(error.message, { status: error.status });
+	return new Response(error instanceof Error ? error.message : String(error), { status: 500 });
 }
 
 async function readJson(req: Request): Promise<Record<string, unknown>> {
@@ -330,21 +445,150 @@ async function main(): Promise<number> {
 			const { pathname } = url;
 
 			if (pathname === "/api/state") {
-				const raw = Number.parseInt(url.searchParams.get("ctx") ?? "", 10);
-				return Response.json(await snapshot(options, Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_CTX));
+				return Response.json(await snapshot(options, ctxOf(url)));
+			}
+			if (pathname === "/api/hub/browse") {
+				try {
+					const preset = hub.presetOf(url.searchParams.get("preset") ?? hub.DEFAULT_PRESET);
+					const sort = hub.sortOf(url.searchParams.get("sort") ?? preset.sort);
+					const fitFilter = fitFilterOf(url.searchParams.get("fit"));
+					const gatedFilter = gatedFilterOf(url.searchParams.get("gated"));
+					const search = (url.searchParams.get("q") ?? "").trim();
+					const ctx = ctxOf(url);
+					const rawLimit = Number.parseInt(url.searchParams.get("limit") ?? "", 10);
+					const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, hub.MAX_LIMIT) : hub.DEFAULT_LIMIT;
+					const rawMax = Number.parseFloat(url.searchParams.get("maxGiB") ?? "");
+					const maxBytes = Number.isFinite(rawMax) && rawMax > 0 ? rawMax * 1024 * MIB : undefined;
+
+					const scanned = await hub.listRepos(preset, search, sort.key, limit);
+					const [files, environment] = await Promise.all([
+						hub.filesFor(scanned.map((repo) => repo.id)),
+						fitEnvironment(),
+					]);
+					const local = new Set(listGgufs(options.modelsDir).map(fold));
+
+					const repos = [];
+					for (const repo of scanned) {
+						if (gatedFilter === "open" && repo.gated) continue;
+						const listed = (files.get(repo.id) ?? []).map((file) => ({
+							...file,
+							// Split weights are installed only as a complete set: llama.cpp opens
+							// shard 1 and expects every sibling beside it.
+							installed: hub.shardPaths(file.rfilename).every((shard) => local.has(fold(hub.flatName(shard)))),
+							// `moe: false` is not a claim that it is dense: without the file's
+							// tensor table there is no expert total, so the --n-cpu-moe branch
+							// cannot fire either way. /api/hub/inspect is what answers this.
+							fit: fitFor({
+								file: file.file,
+								sizeBytes: file.sizeBytes,
+								moe: false,
+								ctx,
+								gpu: environment.gpu,
+								ramFreeMiB: environment.ramFreeMiB,
+								remote: true,
+							}),
+						}));
+						if (listed.length === 0) continue;
+						// Size and fit are asked of the smallest and the best file rather than
+						// of the repository: a repository is worth showing when *something* in
+						// it runs, and the file table below the row says which.
+						if (maxBytes !== undefined && !listed.some((file) => file.sizeBytes <= maxBytes)) continue;
+						if (fitFilter !== "any") {
+							const wanted = fitFilter === "gpu" ? ["gpu"] : ["gpu", "offload"];
+							if (!listed.some((file) => wanted.includes(file.fit.verdict))) continue;
+						}
+						const best = bestFitting(listed)?.rfilename;
+						repos.push({ repo, ...(best === undefined ? {} : { best }), files: listed });
+					}
+
+					return Response.json({
+						preset: preset.key,
+						presets: hub.PRESETS.map(({ key, label, note }) => ({ key, label, note })),
+						sorts: hub.SORTS.map(({ key, label }) => ({ key, label })),
+						query: {
+							search,
+							tags: preset.tags,
+							sort: sort.key,
+							fit: fitFilter,
+							gated: gatedFilter,
+							ctx,
+							...(maxBytes === undefined ? {} : { maxGiB: rawMax }),
+						},
+						scanned: scanned.length,
+						matched: repos.length,
+						repos,
+					});
+				} catch (error) {
+					return hubFailure(error);
+				}
+			}
+			if (pathname === "/api/hub/inspect") {
+				const repo = url.searchParams.get("repo") ?? "";
+				const rfilename = url.searchParams.get("rfilename") ?? "";
+				if (repo.length === 0 || rfilename.length === 0) return new Response("`repo` and `rfilename` are required", { status: 400 });
+				const ctx = ctxOf(url);
+				try {
+					const [parts, inspection, environment] = await Promise.all([hub.partsFor(repo, rfilename), hub.inspect(repo, rfilename), fitEnvironment()]);
+					const sizeBytes = parts.reduce((total, part) => total + part.sizeBytes, 0);
+					const moe = (inspection.info.expertCount ?? 0) > 0 || inspection.info.expertBytes > 0;
+					// Shard 1's tensor table covers shard 1 only, so its expert total is an
+					// undercount: zeroing it keeps fitFor off the --n-cpu-moe branch rather
+					// than letting it suggest a number derived from a fraction of the model.
+					const info = inspection.expertsUnknown ? { ...inspection.info, expertBytes: 0 } : inspection.info;
+					const body: Record<string, unknown> = {
+						fit: fitFor({ file: hub.flatName(rfilename), sizeBytes, info, moe, ctx, gpu: environment.gpu, ramFreeMiB: environment.ramFreeMiB, remote: true }),
+						moe,
+						expertsUnknown: inspection.expertsUnknown,
+						arch: info.arch,
+					};
+					if (info.blockCount !== undefined) body["layers"] = info.blockCount;
+					if (info.trainedContext !== undefined) body["trainedContext"] = info.trainedContext;
+					if (info.expertCount !== undefined) body["experts"] = info.expertCount;
+					return Response.json(body);
+				} catch (error) {
+					return hubFailure(error);
+				}
 			}
 			if (req.method === "POST" && pathname === "/api/download") {
 				const body = await readJson(req);
-				const entry = CATALOG.find((candidate) => candidate.key === body["key"]);
-				if (entry === undefined) return new Response(`unknown catalog key ${JSON.stringify(body["key"])}`, { status: 404 });
-				downloads.start(entry, options.modelsDir);
-				return Response.json({ started: entry.key });
+				const repo = body["repo"];
+				const rfilename = body["rfilename"];
+				if (typeof repo !== "string" || repo.length === 0 || typeof rfilename !== "string" || rfilename.length === 0) {
+					return new Response("`repo` and `rfilename` are required", { status: 400 });
+				}
+				try {
+					// Parts are resolved against the repository's own file list, so a name
+					// that is not in it never reaches the filesystem.
+					const parts = await hub.partsFor(repo, rfilename);
+					const key = hub.downloadKeyOf(repo, rfilename);
+					downloads.start({ key, parts }, options.modelsDir);
+					return Response.json({ started: key });
+				} catch (error) {
+					return hubFailure(error);
+				}
 			}
 			if (req.method === "POST" && pathname === "/api/download/cancel") {
 				const body = await readJson(req);
 				const key = typeof body["key"] === "string" ? body["key"] : "";
 				if (!downloads.cancel(key)) return new Response("no such download", { status: 404 });
 				return Response.json({ cancelled: key });
+			}
+			if (req.method === "POST" && pathname === "/api/models/delete") {
+				const body = await readJson(req);
+				const file = body["file"];
+				if (typeof file !== "string") return new Response("`file` is required", { status: 400 });
+				// The same sentence the page already showed on the row, so the refusal
+				// and the disabled button never disagree.
+				const probe = await probeServer(options.serverPort);
+				const blocked = blockedReason(file, { launched: launcher.status().file, servedIds: probe.models.map((model) => model.id) });
+				if (blocked !== undefined) return new Response(blocked, { status: 409 });
+				try {
+					const removal = remove(options.modelsDir, file);
+					return Response.json(removal);
+				} catch (error) {
+					if (error instanceof WeightsError) return new Response(error.message, { status: error.status });
+					return new Response(error instanceof Error ? error.message : String(error), { status: 500 });
+				}
 			}
 			if (req.method === "POST" && pathname === "/api/serve") {
 				const engine = await readEngine(options.root);

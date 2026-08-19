@@ -47,6 +47,33 @@ export interface Fit {
 	measured?: string;
 }
 
+/** Verdicts ranked best to worst, so "which of these files should I take" is a comparison. */
+const VERDICT_RANK: Record<Verdict, number> = { gpu: 5, offload: 4, partial: 3, cpu: 2, unknown: 1, no: 0 };
+
+/**
+ * The file to take out of one repository's quantisations, for this machine: best
+ * verdict first, and among equal verdicts the largest, because a bigger quant of
+ * the same model is the better one when both run.
+ *
+ * Only `no` is excluded, so a machine with no GPU still gets a recommendation and
+ * it still reads `CPU only`. Deciding what is acceptable belongs to the caller's
+ * filter, not here. Undefined when nothing in the set runs at all, which is a
+ * useful answer rather than a missing one.
+ */
+export function bestFitting<T extends { sizeBytes: number; fit: Fit }>(files: readonly T[]): T | undefined {
+	let best: T | undefined;
+	for (const file of files) {
+		if (file.fit.verdict === "no") continue;
+		if (best === undefined) {
+			best = file;
+			continue;
+		}
+		const better = VERDICT_RANK[file.fit.verdict] - VERDICT_RANK[best.fit.verdict];
+		if (better > 0 || (better === 0 && file.sizeBytes > best.sizeBytes)) best = file;
+	}
+	return best;
+}
+
 export interface Gpu {
 	index: number;
 	name: string;
@@ -65,6 +92,12 @@ export interface FitInput {
 	ctx: number;
 	gpu?: Gpu | undefined;
 	ramFreeMiB: number;
+	/**
+	 * Set for a file that is still on Hugging Face. Only the phrasing changes: an
+	 * absent KV figure then means "the metadata arrives with the file", not "this
+	 * file's header is broken", and those are opposite things to tell an operator.
+	 */
+	remote?: boolean;
 }
 
 export function fitFor(input: FitInput): Fit {
@@ -91,7 +124,12 @@ export function fitFor(input: FitInput): Fit {
 	}
 
 	const need = weightsMiB + (kv ?? 0) + RUNTIME_MIB;
-	const kvText = kv === undefined ? "an unknown KV cache (metadata unreadable)" : `${fmtMiB(kv)} KV at ctx ${input.ctx}`;
+	const kvText =
+		kv !== undefined
+			? `${fmtMiB(kv)} KV at ctx ${input.ctx}`
+			: input.remote === true
+				? "an unknown KV cache (its metadata is still on Hugging Face — inspect the file to size it exactly)"
+				: "an unknown KV cache (metadata unreadable)";
 	if (need <= budgetMiB) {
 		fit.verdict = "gpu";
 		fit.label = "fits on the GPU";

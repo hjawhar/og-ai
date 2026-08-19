@@ -1,0 +1,292 @@
+// The table shape lives once in styles.scss. What is left here is what only the browser needs:
+// it is the one component that stacks presets, filters and a banner above its table, and the one
+// whose rows open into a table of their own.
+:host {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+// A failed Hub call gets its own banner rather than the page's: a browse that could not reach
+// huggingface.co says nothing about the local snapshot still polling fine underneath it.
+.banner {
+  margin: 0;
+  padding: 0.625rem 0.875rem;
+  border: 1px solid color-mix(in srgb, var(--verdict-no) 40%, var(--surface-line));
+  border-radius: 0.5rem;
+  background: color-mix(in srgb, var(--verdict-no) 10%, transparent);
+  color: var(--verdict-no);
+  font-size: 0.8125rem;
+}
+
+.controls {
+  display: flex;
+  flex-direction: column;
+  gap: 0.625rem;
+}
+
+// Segmented: the presets are alternatives, so they read as one control rather than four buttons.
+.presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.375rem;
+}
+
+.preset {
+  padding: 0.3125rem 0.75rem;
+  border: 1px solid var(--surface-line);
+  border-radius: 999px;
+  background: var(--surface-raised);
+  color: var(--ink-dim);
+  font: inherit;
+  font-size: 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    color 120ms ease,
+    border-color 120ms ease,
+    background-color 120ms ease;
+
+  &:disabled {
+    cursor: not-allowed;
+    opacity: 0.45;
+  }
+
+  &:hover:enabled {
+    border-color: var(--ink-faint);
+    color: var(--ink-bright);
+  }
+
+  // The active preset is the whole explanation for what is in the table below it.
+  &--on {
+    border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+    background: color-mix(in srgb, var(--accent) 18%, transparent);
+    color: var(--accent-bright);
+  }
+}
+
+// Which Hub query produced these rows, in the server's own words.
+.preset-note {
+  margin: 0;
+  color: var(--ink-faint);
+  font-size: 0.6875rem;
+  line-height: 1.5;
+}
+
+.filters {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.625rem 1rem;
+}
+
+.filter {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+
+  &--check {
+    cursor: pointer;
+  }
+
+  // Sort answers a different question from the three that narrow the list, so it sits apart.
+  &--end {
+    margin-left: auto;
+  }
+
+  &__label {
+    font-size: 0.6875rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    white-space: nowrap;
+
+    &--inline {
+      letter-spacing: 0;
+      text-transform: none;
+      font-size: 0.75rem;
+      color: var(--ink-dim);
+    }
+  }
+
+  &__control {
+    font: inherit;
+    font-size: 0.75rem;
+
+    &--size {
+      width: 6rem;
+      font-variant-numeric: tabular-nums;
+    }
+  }
+
+  &__unit {
+    font-size: 0.6875rem;
+    color: var(--ink-faint);
+  }
+}
+
+.search {
+  display: flex;
+  align-items: flex-end;
+  gap: 0.625rem;
+  flex-wrap: wrap;
+
+  &__field {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    flex: 1 1 24rem;
+    min-width: 16rem;
+  }
+
+  &__label {
+    font-size: 0.6875rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+  }
+
+  &__input {
+    width: 100%;
+    padding: 0.4375rem 0.625rem;
+    border: 1px solid var(--surface-line);
+    border-radius: 0.375rem;
+    background: var(--surface-base);
+    color: var(--ink-bright);
+    font-size: 0.8125rem;
+
+    &::placeholder {
+      color: var(--ink-faint);
+    }
+
+    &:focus-visible {
+      outline: 2px solid var(--accent-dim);
+      outline-offset: 1px;
+    }
+  }
+}
+
+// A short list must read as filtered rather than as an empty Hub.
+.counts {
+  margin: 0;
+  color: var(--ink-dim);
+  font-size: 0.75rem;
+}
+
+.empty {
+  margin: 0;
+  padding: 1rem;
+  border: 1px dashed var(--surface-line);
+  border-radius: 0.5rem;
+  color: var(--ink-dim);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
+.retry {
+  margin-left: 0.5rem;
+}
+
+// The open repo and the files under it read as one block, whatever the zebra says.
+.grid-table {
+  > tbody > tr.row--open > td,
+  > tbody > tr.files-row > td {
+    background: color-mix(in srgb, var(--accent) 7%, transparent);
+  }
+}
+
+// A repo id is the row's control, so it is a real button: keyboard reaches it, screen readers
+// announce it, and the row still looks like a link.
+.repo {
+  display: block;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--ink-bright);
+  font-weight: 600;
+  font-size: 0.8125rem;
+  text-align: left;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+
+  &:hover {
+    color: var(--accent-bright);
+    text-decoration: underline;
+  }
+}
+
+// Modifiers only: `.chip` and `.chips` live in styles.scss.
+.chip {
+  // Gated is the difference between a download that works and one that 401s.
+  &--warn {
+    border-color: color-mix(in srgb, var(--verdict-offload) 45%, var(--surface-line));
+    color: var(--verdict-offload);
+  }
+
+  // The server's pick, marked in the file table so the inline summary can be found again.
+  &--best {
+    display: inline-block;
+    margin-top: 0.25rem;
+    border-color: color-mix(in srgb, var(--accent) 45%, var(--surface-line));
+    color: var(--accent-bright);
+  }
+}
+
+// Only the marker for the server's pick; the nested table's shape is the shared
+// `.grid-table--nested` in styles.scss.
+.files {
+  > tbody > tr.file-row--best > td {
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
+  }
+}
+
+.quant {
+  display: block;
+  color: var(--ink-bright);
+  font-weight: 600;
+}
+
+.file {
+  display: block;
+  margin-top: 0.25rem;
+  font-size: 0.6875rem;
+  color: var(--ink-faint);
+  overflow-wrap: anywhere;
+}
+
+// The recommended file's size sits under its name rather than in a column of its own.
+.size {
+  display: block;
+  margin-top: 0.25rem;
+  font-size: 0.75rem;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+
+.shards {
+  display: block;
+  margin-top: 0.25rem;
+  font-size: 0.6875rem;
+  color: var(--ink-faint);
+}
+
+.inspect {
+  margin-top: 0.5rem;
+}
+
+.caveat {
+  display: block;
+  margin-top: 0.375rem;
+  color: var(--verdict-offload);
+}
+
+.gated {
+  margin: 0 0 0.625rem;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid color-mix(in srgb, var(--verdict-offload) 40%, var(--surface-line));
+  border-radius: 0.375rem;
+  background: color-mix(in srgb, var(--verdict-offload) 10%, transparent);
+  color: var(--verdict-offload);
+  font-size: 0.75rem;
+  line-height: 1.5;
+}

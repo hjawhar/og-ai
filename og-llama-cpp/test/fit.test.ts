@@ -6,7 +6,7 @@
 import { describe, expect, test } from "bun:test";
 
 import { MEASURED } from "../ui/server/catalog.ts";
-import { fitFor, HEADROOM_MIB, RUNTIME_MIB, type Gpu } from "../ui/server/fit.ts";
+import { bestFitting, fitFor, HEADROOM_MIB, RUNTIME_MIB, type Fit, type Gpu, type Verdict } from "../ui/server/fit.ts";
 import type { GgufInfo } from "../ui/server/gguf.ts";
 
 const MIB = 1024 * 1024;
@@ -157,5 +157,42 @@ describe("fitFor", () => {
 		expect(short.verdict).toBe("gpu");
 		expect(long.verdict).toBe("partial");
 		expect(long.kvMiB ?? 0).toBeGreaterThan(short.kvMiB ?? 0);
+	});
+});
+
+/**
+ * Which quantisation the browser recommends out of one repository. This is the
+ * one number-shaped decision the page makes for the operator, so its order is
+ * pinned: a wrong answer here sends someone to a 30 GiB download that pages to
+ * host RAM, or to a Q2 when a Q4 would have fitted.
+ */
+describe("bestFitting", () => {
+	function file(name: string, sizeGiB: number, verdict: Verdict) {
+		const fit: Fit = { verdict, label: verdict, detail: "", weightsMiB: sizeGiB * 1024, budgetMiB: BUDGET };
+		return { rfilename: name, sizeBytes: sizeGiB * 1024 * MIB, fit };
+	}
+
+	test("a better verdict wins even when it is the smaller file", () => {
+		const best = bestFitting([file("big.gguf", 30, "cpu"), file("small.gguf", 9, "gpu")]);
+		expect(best?.rfilename).toBe("small.gguf");
+	});
+
+	test("among equal verdicts the largest wins, because it is the better quant", () => {
+		const best = bestFitting([file("q3.gguf", 12, "offload"), file("q4.gguf", 16, "offload"), file("q2.gguf", 9, "offload")]);
+		expect(best?.rfilename).toBe("q4.gguf");
+	});
+
+	test("expert offload beats partial offload, which beats running from RAM", () => {
+		expect(bestFitting([file("a.gguf", 20, "partial"), file("b.gguf", 17, "offload")])?.rfilename).toBe("b.gguf");
+		expect(bestFitting([file("a.gguf", 20, "cpu"), file("b.gguf", 25, "partial")])?.rfilename).toBe("b.gguf");
+	});
+
+	test("a CPU-only set still gets a recommendation, since that machine can still run it", () => {
+		expect(bestFitting([file("a.gguf", 20, "cpu"), file("b.gguf", 24, "cpu")])?.rfilename).toBe("b.gguf");
+	});
+
+	test("nothing runnable is undefined rather than the least bad option", () => {
+		expect(bestFitting([file("huge.gguf", 400, "no"), file("bigger.gguf", 900, "no")])).toBeUndefined();
+		expect(bestFitting([])).toBeUndefined();
 	});
 });

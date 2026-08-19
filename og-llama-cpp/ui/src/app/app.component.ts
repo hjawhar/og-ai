@@ -2,7 +2,7 @@ import { ChangeDetectionStrategy, Component, computed, inject } from '@angular/c
 
 import { HardwarePanelComponent } from './components/hardware-panel/hardware-panel.component';
 import { InstalledModelsComponent } from './components/installed-models/installed-models.component';
-import { ModelCatalogComponent } from './components/model-catalog/model-catalog.component';
+import { ModelHubComponent } from './components/model-hub/model-hub.component';
 import { ServerLogComponent } from './components/server-log/server-log.component';
 import { ServerStatusComponent } from './components/server-status/server-status.component';
 import { MibPipe } from './pipes/mib.pipe';
@@ -10,9 +10,11 @@ import { ModelStateService } from './services/model-state.service';
 import type { ServeRequest } from './models/state.model';
 
 /**
- * One screen: what this machine is, what weights it has, what it can fetch, and
- * which of them will actually run well here. Every child is presentational — the
- * service owns the poll, the actions and the only copy of server state.
+ * One screen: what this machine is, what weights it has, what it can fetch from Hugging Face,
+ * and which of them will actually run well here. The children that render the snapshot are
+ * presentational; the service owns the poll, the actions and the only copy of server state.
+ * The Hub browser is the one child with state of its own, because which preset is on screen and
+ * what is half-typed in its box are nobody else's business.
  */
 @Component({
   selector: 'og-root',
@@ -21,7 +23,7 @@ import type { ServeRequest } from './models/state.model';
   imports: [
     HardwarePanelComponent,
     InstalledModelsComponent,
-    ModelCatalogComponent,
+    ModelHubComponent,
     ServerLogComponent,
     ServerStatusComponent,
     MibPipe,
@@ -35,15 +37,14 @@ export class AppComponent {
   readonly error = this.service.error;
   readonly ctx = this.service.ctx;
 
-  /** Which catalogue row is mid-action, so exactly one control reads as working. */
-  readonly busyKey = computed(() => {
-    const pending = this.service.pending();
-    return pending?.kind === 'download' || pending?.kind === 'cancel' ? pending.key : null;
-  });
-
   readonly servingFile = computed(() => {
     const pending = this.service.pending();
     return pending?.kind === 'serve' ? pending.file : null;
+  });
+
+  readonly deletingFile = computed(() => {
+    const pending = this.service.pending();
+    return pending?.kind === 'delete' ? pending.file : null;
   });
 
   readonly stopping = computed(() => this.service.pending()?.kind === 'stop');
@@ -58,12 +59,8 @@ export class AppComponent {
     }
   }
 
-  download(key: string): void {
-    void this.service.download(key);
-  }
-
-  cancelDownload(key: string): void {
-    void this.service.cancelDownload(key);
+  deleteModel(file: string): void {
+    void this.service.deleteModel(file);
   }
 
   stopServer(): void {

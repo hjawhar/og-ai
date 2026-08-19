@@ -1,63 +1,8 @@
-// Tables are the only place this app needs real rules: utilities cannot express
-// zebra striping, a sticky header or column sizing without repeating themselves
-// on every cell.
-.scroller {
-  overflow-x: auto;
-  border: 1px solid var(--surface-line);
-  border-radius: 0.5rem;
-  background: var(--surface-panel);
-}
+// The table shape lives once in styles.scss. What is left here is what only this table needs.
 
-.grid-table {
-  width: 100%;
-  min-width: 62rem;
-  border-collapse: collapse;
-
-  th {
-    position: sticky;
-    top: 0;
-    z-index: 1;
-    padding: 0.5rem 0.75rem;
-    background: var(--surface-raised);
-    border-bottom: 1px solid var(--surface-line);
-    text-align: left;
-    font-size: 0.6875rem;
-    font-weight: 600;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    color: var(--ink-dim);
-    white-space: nowrap;
-  }
-
-  td {
-    padding: 0.75rem;
-    border-bottom: 1px solid var(--surface-line);
-    vertical-align: top;
-    font-size: 0.8125rem;
-  }
-
-  tbody tr:nth-child(even) td {
-    background: color-mix(in srgb, var(--surface-raised) 45%, transparent);
-  }
-
-  tbody tr:last-child td {
-    border-bottom: none;
-  }
-
-  // A file that cannot be served must not read as an equal option.
-  .row--blocked td {
-    opacity: 0.72;
-  }
-}
-
-.num {
-  text-align: right;
-  white-space: nowrap;
-  font-variant-numeric: tabular-nums;
-}
-
-.actions-head {
-  text-align: right;
+// A file that cannot be served must not read as an equal option.
+.grid-table .row--blocked td {
+  opacity: 0.72;
 }
 
 .file {
@@ -67,22 +12,8 @@
   overflow-wrap: anywhere;
 }
 
-.chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.25rem;
-  margin-top: 0.375rem;
-}
-
-.chip {
-  padding: 0.0625rem 0.4375rem;
-  border: 1px solid var(--surface-line);
-  border-radius: 0.25rem;
-  font-size: 0.6875rem;
-  color: var(--ink-dim);
-  white-space: nowrap;
-}
-
+// A truncated file is broken; a file still arriving is only unfinished. Red for one, amber for
+// the other, so the two do not read as the same problem.
 .incomplete {
   display: block;
   margin-top: 0.25rem;
@@ -90,10 +21,20 @@
   color: var(--verdict-no);
 }
 
-.detail {
-  max-width: 30rem;
+.arriving {
+  display: block;
+  margin-top: 0.25rem;
+  font-size: 0.6875rem;
+  color: var(--verdict-offload);
+}
+
+// Why Delete is off. Not a defect like the two above — the file is fine, something else is
+// holding it — so it stays in the body ink rather than claiming a colour that means broken.
+.held {
+  display: block;
+  margin-top: 0.25rem;
+  font-size: 0.6875rem;
   color: var(--ink-dim);
-  line-height: 1.45;
 }
 
 .measured {
@@ -150,4 +91,66 @@
   border-radius: 0.5rem;
   color: var(--ink-dim);
   font-size: 0.8125rem;
+}
+
+/**
+ * The delete confirmation. A native <dialog>: the browser owns modality, the top layer, the
+ * backdrop, the focus trap and Escape, so all that is left here is the panel's skin. The one
+ * dialog on the page, so it stays with the table that opens it rather than in styles.scss.
+ */
+.confirm {
+  max-width: 32rem;
+  padding: 1.25rem;
+  border: 1px solid var(--surface-line);
+  border-radius: 0.5rem;
+  background: var(--surface-panel);
+  color: var(--ink);
+  font-size: 0.8125rem;
+
+  &::backdrop {
+    background: rgb(0 0 0 / 0.6);
+  }
+
+  &__title {
+    margin: 0 0 0.625rem;
+    font-size: 0.9375rem;
+    font-weight: 600;
+    color: var(--ink-bright);
+  }
+
+  &__file {
+    margin: 0;
+    color: var(--ink-bright);
+    overflow-wrap: anywhere;
+  }
+
+  &__size {
+    margin: 0.125rem 0 0.75rem;
+    color: var(--ink-dim);
+    font-variant-numeric: tabular-nums;
+  }
+
+  &__body {
+    margin: 0 0 0.75rem;
+    line-height: 1.5;
+  }
+
+  // Every file that goes, so the count in the button has something to point at.
+  &__shards {
+    max-height: 12rem;
+    margin: 0 0 0.75rem;
+    padding-left: 1.25rem;
+    overflow-y: auto;
+    color: var(--ink-dim);
+
+    li {
+      overflow-wrap: anywhere;
+    }
+  }
+
+  &__actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+  }
 }

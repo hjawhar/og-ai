@@ -10,11 +10,11 @@ One of the two projects in the [`og-ai`](../README.md) repository, alongside
 [`og-cli`](../og-cli). Agent-facing context for both lives in one place,
 [`../AGENTS.md`](../AGENTS.md).
 
-There is no CI here and nothing is published. `bun test` covers the two pure pieces — the GGUF
-reader and the fit arithmetic behind the UI's verdicts — and everything else needs a GPU and
-minutes of wall time, so verification is local: `llama-server --list-devices` after an install, a
-`bun run serve.ts` launch, and a sweep compared against [`docs/benchmarks.md`](docs/benchmarks.md)
-after a build bump.
+There is no CI here and nothing is published. `bun test` covers the three pure pieces — the GGUF
+reader, the fit arithmetic behind the UI's verdicts, and the Hugging Face parsing behind its model
+search — and everything else needs a GPU and minutes of wall time, so verification is local:
+`llama-server --list-devices` after an install, a `bun run serve.ts` launch, and a sweep compared
+against [`docs/benchmarks.md`](docs/benchmarks.md) after a build bump.
 
 | Path | Platform | Method |
 | --- | --- | --- |
@@ -237,19 +237,62 @@ bun run ui           # http://127.0.0.1:8130 — the JSON API and the built page
 bun run ui:build     # rebuild the Angular bundle into ui/dist/ui/browser
 ```
 
+![The model UI: server state, GPU budget, and the weights installed on this machine](docs/images/model-ui.png)
+
 An Angular + TailwindCSS app in [`ui/`](ui/) — standalone components, SCSS component styles, its
 own npm workspace — served together with its JSON API by a single Bun process on loopback. It
 answers the three questions that decide whether a local setup is worth using:
 
 - **What is installed** — every `.gguf` in the models directory, with the architecture, layer count
-  and expert count read out of the file's own GGUF metadata, and a red flag when a file is shorter
-  than the catalogued `content-length`, because a truncated GGUF fails minutes into loading with a
-  tensor-count error.
-- **What can be downloaded** — the weights this repository has measured plus a few smaller coding
-  models, with live received/total bytes and MB/s while a fetch runs, and a cancel that stops it.
+  and expert count read out of the file's own GGUF metadata, and a flag when a file is not servable
+  yet: `downloading` when a `.part` sibling sits beside it, `short` when the file's own tensor table
+  needs more bytes than the file holds. Both are read from the file rather than compared against a
+  size written down here, and the second matters because a truncated GGUF fails minutes into
+  loading with a tensor-count error.
+  Each row can be **deleted**, behind a confirmation dialog that names the files and the space they
+  free, because a model that disappoints should not need a shell to remove. Deletion is the only
+  destructive thing this server does, so it is narrow: the name must be a bare `.gguf` basename that
+  resolves inside the models directory, a `gguf-split` set goes as a set — one shard of three frees
+  nothing and breaks a model that still looks installed — and a file the running server holds open
+  or a transfer is about to write is refused with the reason, on the row and again from the API. On
+  Windows a mapped file cannot be unlinked at all, so that refusal replaces an OS error nobody
+  asked for.
+- **What exists to download** — a live browse of Hugging Face, filtered to repositories that ship
+  GGUF because this engine loads nothing else. There is no curated list: **presets** are *queries*,
+  each one a set of Hub tags and a sort order, and each states the query it runs rather than asking
+  anyone to trust a label — `Agentic coding` is `gguf + code + agent` by downloads, `Trending now`
+  is the Hub's own trending score, and so on. **Filters** narrow it on this machine's terms: only
+  models that run on the GPU (with or without expert offload), only those that fit it entirely, a
+  maximum size, open licences only, and free text within the preset. Every repository arrives with
+  its GGUF files already sized — quantisation, total bytes, and a shard count for weights
+  `gguf-split` broke into parts, which the download then fetches as a set — and with one file
+  marked as the one to take here: the best verdict, and among equals the largest, because a bigger
+  quant of the same model is the better one when both run. Vision projectors and
+  multi-token-prediction heads are left out: they are GGUF but not weights, `serve.ts` builds no
+  flag for either, and being small they would otherwise read as the one thing on the page that
+  comfortably fits. **Inspect** reads a remote file's own GGUF header over a range request — 4 MiB
+  of a 16 GiB file — so a model nobody here has benchmarked gets the same arithmetic an installed
+  one does, before the download. Gated repositories are marked; fetching one needs `HF_TOKEN` in
+  the environment the UI runs in.
 - **What this hardware can actually run** — per model: `fits on the GPU`, `fits with expert offload`
   (with the `--n-cpu-moe N` to use), `partial offload only` (with `-ngl N`), `CPU only`, or
   `too large for this machine`.
+
+Filtering by fit is exact rather than a guess, because the Hub's search results carry no file
+sizes: the browse reads each repository's file list itself, eight requests in parallel and cached
+for ten minutes, which measured 368 ms for a dozen repositories and 303 ms for a warm page.
+
+![Deleting weights, behind a confirmation that names the files and the space](docs/images/model-ui-delete.png)
+
+![Browsing Hugging Face: presets, filters, and the file to take on this card](docs/images/model-ui-browse.png)
+
+![Inspect: the real GGUF header, read over a range request before downloading](docs/images/model-ui-inspect.png)
+
+The row above is what Inspect buys: `UD-Q3_K_XL` at 13.36 GiB looked like a size and nothing else,
+and the header turns it into 595 MiB of KV cache at ctx 32768 across 49 layers, 128 experts, and the
+single expert layer that has to move to the CPU — `--n-cpu-moe 1` — decided before a byte of the
+download is spent. Every other row in that table still reads `an unknown KV cache`, because nobody
+has asked those files yet.
 
 The verdict is the point, and it is the whole reason the page exists. Weights that do not fit still
 load and still answer, while the driver pages them to host RAM at ~8x the cost
@@ -261,11 +304,20 @@ allowance, against total VRAM minus the 1200 MiB of headroom every measured prof
 
 Two labels, never mixed. **measured** means a row of `docs/benchmarks.md` for that exact file and
 context — those win over arithmetic, and the suggested `--n-cpu-moe` is then the value
-`tools/profile-sweep.ts` actually ran. **estimated** means computed from the GGUF's own metadata: KV
-cache from `block_count` × `head_count_kv` × `key_length` at q8_0, per-layer expert size from the
-summed `*_exps.*` tensors, plus the ~900 MiB runtime allowance, against total VRAM minus 1200 MiB.
-Honest arithmetic, not a measurement — the allowance is itself derived from the one case where both
-exist (Q4_K_XL at ctx 32768, `--n-cpu-moe 14`: 13839 MiB computed against 14714 MiB measured).
+`tools/profile-sweep.ts` actually ran. **estimated** means computed from the GGUF's own metadata:
+the KV cache summed layer by layer at q8_0, per-layer expert size from the summed `*_exps.*`
+tensors, plus the ~900 MiB runtime allowance, against total VRAM minus 1200 MiB. Honest arithmetic,
+not a measurement — the allowance is itself derived from the one case where both exist (Q4_K_XL at
+ctx 32768, `--n-cpu-moe 14`: 13839 MiB computed against 14714 MiB measured).
+
+Layer by layer matters, because attention in a current model is not uniform. Gemma 4 26B A4B
+alternates 8 KV heads with 2 and gives 25 of its 30 layers a 1024-token sliding window with
+256-wide heads; charging every layer the full-attention shape overstates its cache at ctx 32768 by
+36x — 16320 MiB against the real 446 MiB — which reports a model that runs on this card with
+`--n-cpu-moe 6` as CPU-only. So `head_count_kv`, `sliding_window`, `sliding_window_pattern` and the
+SWA key and value lengths are all read per layer where the file publishes them. A file that
+publishes a window but not which layers use it is charged full attention everywhere: overstating is
+the safe direction, and nothing here invents a pattern the file did not state.
 
 A third kind of number, kept away from both: the GPU card's **peak** FLOPS and TOPS —
 175.8 TFLOPS dense fp16 and 351.5 TOPS dense int8 on the reference 5070 Ti. It is a ceiling, not a
@@ -292,8 +344,11 @@ acknowledgement rather than state — the page re-fetches after every one:
 
 | Route | Purpose |
 | --- | --- |
-| `GET /api/state?ctx=<n>` | hardware, engine, reachable server, installed weights, catalogue, and a fit verdict per model at context `n` |
-| `POST /api/download`, `POST /api/download/cancel` | start or cancel a catalogue download by key |
+| `GET /api/state?ctx=<n>` | hardware, engine, reachable server, installed weights, live downloads, and a fit verdict per installed model at context `n` |
+| `GET /api/hub/browse?preset=&q=&sort=&fit=&maxGiB=&gated=&limit=&ctx=` | one page of Hugging Face repositories with their GGUF files sized, a fit verdict each, and the file to take on this machine; also returns the preset and sort vocabulary, so nothing downstream hardcodes it |
+| `GET /api/hub/inspect?repo=&rfilename=&ctx=` | the remote file's real GGUF metadata, read over a range request, and the verdict that follows from it |
+| `POST /api/download`, `POST /api/download/cancel` | start a `{repo, rfilename}` download — every shard of it — or cancel one by key |
+| `POST /api/models/delete` | remove one installed model, every shard of it; 409 with the reason when the server holds it or a transfer is writing it |
 | `POST /api/serve`, `POST /api/server/stop` | spawn `serve.ts` for one file; kill what was spawned |
 
 Flags on the Bun process (`ui/server/main.ts`): `--port`, `--host`, `--models-dir`
@@ -355,7 +410,11 @@ curl -SfL --retry 5 -C - -O \
 Verify the size against the server's `content-length` (17665334432 bytes for that file) — a
 truncated GGUF fails at load with a tensor-count error, not a checksum error.
 
-`bun run ui` does the same check in a browser, with the fit verdict beside each file.
+`bun run ui` is the easier path — it browses Hugging Face, fetches every shard of a split model,
+writes to `<name>.gguf.part` until the transfer completes, and flags an installed file as `short`
+when its own tensor table needs more bytes than the file holds, which catches a died transfer
+without needing a byte count written down anywhere.
+
 `bun run serve.ts --list` shows what each profile expects, and a launch that cannot find its
 weights lists the `.gguf` files it did find — which is the fastest way to catch a filename typo
 before anything touches the GPU. Operational failure modes of a *running* engine — VRAM spill, a

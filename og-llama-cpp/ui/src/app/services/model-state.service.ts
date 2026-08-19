@@ -1,7 +1,8 @@
 import { DestroyRef, DOCUMENT, Injectable, inject, signal } from '@angular/core';
-import { HttpClient, HttpErrorResponse, HttpParams } from '@angular/common/http';
+import { HttpClient, HttpParams } from '@angular/common/http';
 import { firstValueFrom } from 'rxjs';
 
+import { describeFailure } from './api-failure';
 import type { PendingAction, ServeRequest, StateResponse } from '../models/state.model';
 
 /**
@@ -17,8 +18,10 @@ const MIN_CTX = 512;
 const MAX_CTX = 1_048_576;
 
 /**
- * The single owner of server state. Everything on the page reads `state()`; nothing else in
- * the app talks to the API, holds a timer, or decides what a POST meant.
+ * The single owner of the polled snapshot and of every mutation. Everything on the page reads
+ * `state()`, and nothing else in the app holds a timer, POSTs, or decides what a POST meant;
+ * `model-hub.service.ts` reads the Hub browser's GET-only endpoints and owns no state beyond
+ * the filters, rows and inspections on screen.
  */
 @Injectable({ providedIn: 'root' })
 export class ModelStateService {
@@ -78,12 +81,25 @@ export class ModelStateService {
     void this.read();
   }
 
-  download(key: string): Promise<void> {
-    return this.act({ kind: 'download', key }, '/api/download', { key });
-  }
-
   cancelDownload(key: string): Promise<void> {
     return this.act({ kind: 'cancel', key }, '/api/download/cancel', { key });
+  }
+
+  /**
+   * Unlink a file, and with it every shard of a split set. Which files that is, and whether it is
+   * allowed at all, is the server's call: this only says which row the operator confirmed.
+   */
+  deleteModel(file: string): Promise<void> {
+    return this.act({ kind: 'delete', file }, '/api/models/delete', { file });
+  }
+
+  /**
+   * Fetch a file the Hub browser found. `downloadKey` is the server's, passed through from the
+   * row rather than rebuilt here, so the pending action and `state().downloads` agree on one
+   * spelling of the key.
+   */
+  downloadHubFile(repo: string, rfilename: string, downloadKey: string): Promise<void> {
+    return this.act({ kind: 'download', key: downloadKey }, '/api/download', { repo, rfilename });
   }
 
   serve(request: ServeRequest): Promise<void> {
@@ -149,31 +165,4 @@ export class ModelStateService {
       await this.read();
     }
   }
-}
-
-function describeFailure(cause: unknown): string {
-  if (cause instanceof HttpErrorResponse) {
-    // status 0 is the browser refusing to say more: the API is down or the port moved.
-    if (cause.status === 0) {
-      return 'Cannot reach the model API. Is `bun run ui` still running on 127.0.0.1:8130?';
-    }
-    const detail = messageFromBody(cause.error);
-    return detail === null
-      ? `${cause.status} ${cause.statusText} from ${cause.url ?? 'the API'}`
-      : `${cause.status} ${cause.statusText}: ${detail}`;
-  }
-  return cause instanceof Error ? cause.message : String(cause);
-}
-
-function messageFromBody(body: unknown): string | null {
-  if (typeof body === 'string' && body.trim() !== '') {
-    return body.trim();
-  }
-  if (typeof body === 'object' && body !== null && 'error' in body) {
-    const { error } = body as { error: unknown };
-    if (typeof error === 'string' && error.trim() !== '') {
-      return error.trim();
-    }
-  }
-  return null;
 }

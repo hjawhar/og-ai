@@ -31,12 +31,18 @@ interface Launched {
 	pid: number | null;
 	launching: boolean;
 	log: string[];
+	/**
+	 * Weights this process launched. Kept because a running llama-server holds its
+	 * file mapped: on Windows that makes the file undeletable, and knowing which
+	 * one lets the page refuse before the operator finds out from an OS error.
+	 */
+	file: string | null;
 }
 
-const state: Launched = { pid: null, launching: false, log: [] };
+const state: Launched = { pid: null, launching: false, log: [], file: null };
 
-export function status(): { pid: number | null; launching: boolean; log: string[] } {
-	return { pid: state.pid, launching: state.launching, log: state.log.slice(-60) };
+export function status(): { pid: number | null; launching: boolean; log: string[]; file: string | null } {
+	return { pid: state.pid, launching: state.launching, log: state.log.slice(-60), file: state.file };
 }
 
 export function launch(options: LaunchOptions, request: LaunchRequest): number | null {
@@ -59,6 +65,7 @@ export function launch(options: LaunchOptions, request: LaunchRequest): number |
 	if (request.alias !== undefined) argv.push("--alias", request.alias);
 
 	state.log = [`$ ${argv.slice(1).join(" ")}`];
+	state.file = request.file;
 	state.launching = true;
 	const child = Bun.spawn(argv, {
 		cwd: options.cwd,
@@ -81,6 +88,9 @@ export function stop(): void {
 	const pid = state.pid;
 	state.pid = null;
 	state.launching = false;
+	// Cleared with the process: weights are only held while it runs, and a stale
+	// name here would refuse a deletion that is perfectly safe.
+	state.file = null;
 	if (pid !== null) killTree(pid);
 }
 

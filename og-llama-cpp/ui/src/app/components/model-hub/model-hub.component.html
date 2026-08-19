@@ -1,0 +1,357 @@
+@let reply = response();
+
+<div class="controls">
+  @if (reply) {
+    <div class="presets" role="group" aria-label="Hugging Face preset">
+      @for (preset of reply.presets; track preset.key) {
+        <button
+          type="button"
+          class="preset"
+          [class.preset--on]="preset.key === activePreset()"
+          [disabled]="loading()"
+          (click)="hub.setPreset(preset.key)"
+        >
+          {{ preset.label }}
+        </button>
+      }
+    </div>
+    @if (presetNote(); as note) {
+      <p class="preset-note">{{ note }}</p>
+    }
+  }
+
+  <div class="filters">
+    <label class="filter">
+      <span class="filter__label">Show</span>
+      <select
+        #fitSelect
+        class="field filter__control"
+        [disabled]="loading()"
+        (change)="setFit(fitSelect.value)"
+      >
+        @for (option of fitOptions; track option.key) {
+          <option [value]="option.key" [selected]="option.key === activeFit()">
+            {{ option.label }}
+          </option>
+        }
+      </select>
+    </label>
+
+    <label class="filter">
+      <span class="filter__label">No larger than</span>
+      <input
+        #maxSize
+        type="number"
+        class="field filter__control filter__control--size"
+        min="0"
+        step="1"
+        placeholder="any"
+        [value]="maxGiBText()"
+        (change)="hub.setMaxGiB(maxSize.value)"
+      />
+      <span class="filter__unit">GiB</span>
+    </label>
+
+    <label class="filter filter--check">
+      <input
+        #openGate
+        type="checkbox"
+        [checked]="openOnly()"
+        [disabled]="loading()"
+        (change)="setOpenOnly(openGate.checked)"
+      />
+      <span class="filter__label filter__label--inline">Skip repos needing an accepted licence</span>
+    </label>
+
+    @if (reply) {
+      <label class="filter filter--end">
+        <span class="filter__label">Sort</span>
+        <select
+          #sortSelect
+          class="field filter__control"
+          [disabled]="loading()"
+          (change)="hub.setSort(sortSelect.value)"
+        >
+          @for (option of reply.sorts; track option.key) {
+            <option [value]="option.key" [selected]="option.key === activeSort()">
+              {{ option.label }}
+            </option>
+          }
+        </select>
+      </label>
+    }
+  </div>
+
+  <div class="search">
+    <label class="search__field">
+      <span class="search__label">Narrow within this preset</span>
+      <input
+        #q
+        type="search"
+        class="search__input font-mono"
+        placeholder="qwen3-coder, unsloth, bartowski…"
+        [value]="query()"
+        (keydown.enter)="hub.search(q.value)"
+      />
+    </label>
+    <button type="button" class="btn btn-primary" [disabled]="loading()" (click)="hub.search(q.value)">
+      {{ loading() ? 'Asking…' : 'Search' }}
+    </button>
+  </div>
+</div>
+
+@if (error(); as message) {
+  <p class="banner" role="alert">{{ message }}</p>
+}
+
+@if (reply) {
+  @if (reply.matched !== reply.scanned) {
+    <p class="counts">
+      {{ reply.matched | number }} of the {{ reply.scanned | number }} repositories huggingface.co
+      returned for this preset pass these filters.
+    </p>
+  }
+
+  @if (reply.repos.length === 0) {
+    <p class="empty">
+      @if (reply.scanned > 0) {
+        None of the {{ reply.scanned | number }} repositories this preset matched passed the
+        filters above. Loosen the verdict, raise the size ceiling, or clear the text box.
+      } @else {
+        Hugging Face returned no GGUF repository for this preset.
+      }
+    </p>
+  } @else {
+    <div class="scroller">
+      <table class="grid-table">
+        <thead>
+          <tr>
+            <th>Repository</th>
+            <th class="num">Downloads</th>
+            <th class="num">Likes</th>
+            <th>Recommended here</th>
+            <th>Fits this GPU?</th>
+            <th>Working</th>
+            <th class="actions-head">Files</th>
+          </tr>
+        </thead>
+        <tbody>
+          @for (result of reply.repos; track result.repo.id) {
+            @let open = expanded() === result.repo.id;
+            @let best = recommended(result);
+            <tr [class.row--open]="open">
+              <td>
+                <button type="button" class="repo font-mono" (click)="hub.toggle(result.repo.id)">
+                  {{ result.repo.id }}
+                </button>
+                <span class="chips">
+                  @if (result.repo.gated) {
+                    <span class="chip chip--warn">gated</span>
+                  }
+                  @if (result.repo.pipeline; as pipeline) {
+                    <span class="chip">{{ pipeline }}</span>
+                  }
+                  @if (result.repo.updatedAt; as updated) {
+                    <span class="chip">updated {{ updated | date: 'y-MM-dd' }}</span>
+                  }
+                </span>
+              </td>
+              <td class="num">{{ result.repo.downloads | number }}</td>
+              <td class="num">{{ result.repo.likes | number }}</td>
+              @if (best; as pick) {
+                @let bestFit = inspections()[pick.downloadKey]?.fit ?? pick.fit;
+                <td>
+                  @if (pick.quant; as quant) {
+                    <span class="quant">{{ quant }}</span>
+                  }
+                  <span class="file font-mono">{{ pick.file }}</span>
+                  <span class="size">{{ pick.sizeBytes | bytes }}</span>
+                </td>
+                <td><og-verdict-badge [fit]="bestFit" /></td>
+                <td class="detail">{{ bestFit.detail }}</td>
+              } @else {
+                <td class="detail" colspan="3">
+                  Nothing in this repository runs on this card: the server picked no file for it.
+                  The full list is below.
+                </td>
+              }
+              <td class="actions">
+                <button type="button" class="btn btn-quiet" (click)="hub.toggle(result.repo.id)">
+                  {{ open ? 'Hide files' : result.files.length + ' GGUFs' }}
+                </button>
+              </td>
+            </tr>
+
+            @if (open) {
+              <tr class="files-row">
+                <td colspan="7">
+                  @if (result.repo.gated && !hubTokenPresent()) {
+                    <p class="gated">
+                      Gated repo: Hugging Face serves it only to an account that has accepted its
+                      terms, and this UI server has no token, so a download started here will
+                      fail. Set <code class="font-mono">HF_TOKEN</code> (or
+                      <code class="font-mono">HUGGING_FACE_HUB_TOKEN</code>) in the environment
+                      <code class="font-mono">bun run ui</code> runs in, then restart it.
+                    </p>
+                  }
+
+                  <table class="grid-table grid-table--nested files">
+                    <thead>
+                      <tr>
+                        <th>Quant</th>
+                        <th class="num">Size</th>
+                        <th>Fits this GPU?</th>
+                        <th>Working</th>
+                        <th class="actions-head">Get</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      @for (file of result.files; track file.rfilename) {
+                        @let inspection = inspections()[file.downloadKey];
+                        @let fit = inspection?.fit ?? file.fit;
+                        <tr [class.file-row--best]="file.rfilename === result.best">
+                          <td>
+                            @if (file.quant; as quant) {
+                              <span class="quant">{{ quant }}</span>
+                            }
+                            <span class="file font-mono">{{ file.file }}</span>
+                            @if (file.rfilename === result.best) {
+                              <span class="chip chip--best">recommended</span>
+                            }
+                          </td>
+                          <td class="num">
+                            {{ file.sizeBytes | bytes }}
+                            @if (file.shards > 1) {
+                              <span class="shards">{{ file.shards }} shards, fetched together</span>
+                            }
+                          </td>
+                          <td>
+                            <og-verdict-badge [fit]="fit" />
+                            @if (!inspection) {
+                              <button
+                                type="button"
+                                class="btn btn-quiet inspect"
+                                [disabled]="inspecting() === file.downloadKey"
+                                title="Reads the file's real header over a range request"
+                                (click)="inspect(result, file)"
+                              >
+                                {{ inspecting() === file.downloadKey ? 'Reading…' : 'Inspect' }}
+                              </button>
+                            }
+                          </td>
+                          <td class="detail">
+                            {{ fit.detail }}
+                            @if (inspection; as header) {
+                              @let chips = chipsFor(header);
+                              @if (chips.length > 0) {
+                                <span class="chips">
+                                  @for (chip of chips; track chip) {
+                                    <span class="chip">{{ chip }}</span>
+                                  }
+                                </span>
+                              }
+                              @if (header.expertsUnknown) {
+                                <span class="caveat">
+                                  Sharded: this header sizes the KV cache, but its tensor table
+                                  covers only the first shard, so no expert-offload split can
+                                  honestly be suggested from it.
+                                </span>
+                              }
+                            }
+                          </td>
+                          <td class="actions">
+                            @if (downloads()[file.downloadKey]; as download) {
+                              @switch (download.state) {
+                                @case ('downloading') {
+                                  <div class="progress">
+                                    <span class="progress__text font-mono">
+                                      {{ percentOf(download) | number: '1.1-1' }}% ·
+                                      {{ download.receivedBytes | bytes }} /
+                                      {{ download.totalBytes | bytes }} ·
+                                      {{ download.mbps | number: '1.0-0' }} MiB/s
+                                    </span>
+                                    @if (
+                                      download.partIndex !== undefined &&
+                                      download.partCount !== undefined
+                                    ) {
+                                      <span class="progress__text font-mono">
+                                        part {{ download.partIndex }} of {{ download.partCount }} ·
+                                        {{ download.file }}
+                                      </span>
+                                    }
+                                    <span class="bar">
+                                      <i [style.width.%]="percentOf(download)"></i>
+                                    </span>
+                                    <button
+                                      type="button"
+                                      class="btn btn-danger"
+                                      [disabled]="busyKey() === file.downloadKey"
+                                      (click)="cancel(file)"
+                                    >
+                                      Cancel
+                                    </button>
+                                  </div>
+                                }
+                                @case ('error') {
+                                  <button
+                                    type="button"
+                                    class="btn"
+                                    [disabled]="busyKey() === file.downloadKey"
+                                    (click)="startDownload(result, file)"
+                                  >
+                                    Retry
+                                  </button>
+                                  <span class="failed">
+                                    {{ download.error ?? 'download failed' }}
+                                  </span>
+                                }
+                                @default {
+                                  @if (file.installed) {
+                                    <span class="installed">installed</span>
+                                  } @else {
+                                    <button
+                                      type="button"
+                                      class="btn"
+                                      [disabled]="busyKey() === file.downloadKey"
+                                      (click)="startDownload(result, file)"
+                                    >
+                                      Download
+                                    </button>
+                                  }
+                                }
+                              }
+                            } @else if (file.installed) {
+                              <span class="installed">installed</span>
+                            } @else {
+                              <button
+                                type="button"
+                                class="btn"
+                                [disabled]="busyKey() === file.downloadKey"
+                                (click)="startDownload(result, file)"
+                              >
+                                {{ busyKey() === file.downloadKey ? 'Starting…' : 'Download' }}
+                              </button>
+                            }
+                          </td>
+                        </tr>
+                      }
+                    </tbody>
+                  </table>
+                </td>
+              </tr>
+            }
+          }
+        </tbody>
+      </table>
+    </div>
+  }
+} @else {
+  <p class="empty">
+    @if (loading()) {
+      Asking huggingface.co for what this machine can run…
+    } @else {
+      The Hub could not be read, so there is nothing to browse.
+      <button type="button" class="btn btn-quiet retry" (click)="retry()">Try again</button>
+    }
+  </p>
+}

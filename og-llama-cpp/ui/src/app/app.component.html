@@ -28,10 +28,11 @@
       Verdicts are computed for <strong>ctx {{ snapshot.ctx }}</strong> against a
       <strong>{{ snapshot.hardware.budgetMiB | mib: 'gib' }}</strong> budget: weights, plus the q8_0
       KV cache that context needs, plus ~900 MiB of runtime. A row marked
-      <strong>measured</strong> is a real run recorded in docs/benchmarks.md; everything else is
-      estimated from the GGUF's own metadata. Weights that do not fit still load and still answer —
-      the driver just pages them to host RAM and runs about 8x slower, with nothing in any log to
-      say so.
+      <strong>measured</strong> is a real run recorded in docs/benchmarks.md and beats every
+      estimate beside it; an installed file without one is estimated from its own GGUF metadata,
+      and a file still on the Hub from its size alone until it is inspected. Weights that do not
+      fit still load and still answer — the driver just pages them to host RAM and runs about 8x
+      slower, with nothing in any log to say so.
     </p>
 
     <section class="section">
@@ -44,18 +45,25 @@
         [modelsDir]="snapshot.modelsDir"
         [defaultCtx]="snapshot.ctx"
         [serving]="servingFile()"
+        [deleting]="deletingFile()"
         (serveRequested)="serve($event)"
+        (deleteRequested)="deleteModel($event)"
       />
     </section>
 
     <section class="section">
-      <h2 class="section__title">Available to download</h2>
-      <og-model-catalog
-        [entries]="snapshot.catalog"
-        [busyKey]="busyKey()"
-        (downloadRequested)="download($event)"
-        (cancelRequested)="cancelDownload($event)"
-      />
+      <h2 class="section__title">
+        Browse Hugging Face
+        <span class="section__hint">anything published as GGUF, filtered to what runs here</span>
+      </h2>
+      <p class="note">
+        A Hub file's verdict starts from its size alone, since its metadata is still on the other
+        end of the wire — <strong>Inspect</strong> reads the real header over a range request,
+        which is what turns that guess into the arithmetic the installed table above shows.
+        <strong>Recommended here</strong> is the server's own pick for this card: the best verdict
+        in the repository, and the largest file among equals.
+      </p>
+      <og-model-hub />
     </section>
 
     <section class="section">

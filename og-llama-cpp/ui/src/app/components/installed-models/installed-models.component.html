@@ -1,7 +1,8 @@
 @if (models().length === 0) {
   <p class="empty">
     No <code class="font-mono">.gguf</code> files in
-    <code class="font-mono">{{ modelsDir() }}</code> yet — pick one from the catalogue below.
+    <code class="font-mono">{{ modelsDir() }}</code> yet — pick one from the Hugging Face browser
+    below.
   </p>
 } @else {
   <div class="scroller">
@@ -12,11 +13,13 @@
           <th class="num">Size</th>
           <th>Fits this GPU?</th>
           <th>Working</th>
-          <th class="actions-head">Launch</th>
+          <th class="actions-head">Actions</th>
         </tr>
       </thead>
       <tbody>
         @for (model of models(); track model.file) {
+          <!-- Which file an action is in flight for, so one row's buttons rest while it runs. -->
+          @let busy = serving() === model.file || deleting() === model.file;
           <tr [class.row--blocked]="model.incomplete">
             <td>
               <span class="file font-mono">{{ model.file }}</span>
@@ -29,9 +32,27 @@
             <td class="num">
               {{ model.sizeBytes | bytes }}
               @if (model.incomplete; as partial) {
-                <span class="incomplete">
-                  incomplete: {{ partial.haveBytes | bytes }} of {{ partial.expectBytes | bytes }}
-                </span>
+                @switch (partial.reason) {
+                  @case ('downloading') {
+                    <span class="arriving">
+                      still downloading: {{ partial.haveBytes | bytes }} written so far
+                    </span>
+                  }
+                  @case ('short') {
+                    <span class="incomplete">
+                      @if (partial.expectBytes; as expected) {
+                        truncated: {{ partial.haveBytes | bytes }} on disk, {{ expected | bytes }}
+                        needed by its own tensor table
+                      } @else {
+                        truncated: {{ partial.haveBytes | bytes }} on disk is short of what its own
+                        tensor table needs
+                      }
+                    </span>
+                  }
+                }
+              }
+              @if (model.blocked; as reason) {
+                <span class="held">{{ reason }}</span>
               }
             </td>
             <td><og-verdict-badge [fit]="model.fit" /></td>
@@ -55,12 +76,21 @@
                 </label>
                 <button
                   type="button"
-                  class="btn btn--primary"
-                  [disabled]="!!model.incomplete || serving() === model.file"
-                  [title]="model.incomplete ? 'Still downloading or truncated' : 'Launch through serve.ts'"
+                  class="btn btn-primary"
+                  [disabled]="!!model.incomplete || busy"
+                  [title]="titleFor(model)"
                   (click)="serve(model)"
                 >
                   {{ serving() === model.file ? 'Starting…' : 'Serve' }}
+                </button>
+                <button
+                  type="button"
+                  class="btn btn-danger"
+                  [disabled]="model.blocked !== undefined || busy"
+                  [title]="model.blocked ?? 'Unlink this file from the models directory'"
+                  (click)="pendingDelete.set(model)"
+                >
+                  {{ deleting() === model.file ? 'Deleting…' : 'Delete' }}
                 </button>
               </div>
             </td>
@@ -70,3 +100,45 @@
     </table>
   </div>
 }
+
+<!--
+  A native modal: the browser owns the top layer, the backdrop, the focus trap and Escape, so
+  there is no dialog library here and no scroll-locking of our own. It is always in the markup
+  and empty while closed, because the row it asks about is what @if renders inside it.
+-->
+<dialog
+  #confirmDialog
+  class="confirm"
+  aria-labelledby="confirm-delete-title"
+  (close)="pendingDelete.set(null)"
+>
+  @if (pendingDelete(); as model) {
+    @let count = model.shards.length;
+    <h2 class="confirm__title" id="confirm-delete-title">Delete these weights?</h2>
+    <p class="confirm__file font-mono">{{ model.file }}</p>
+    <p class="confirm__size">{{ model.sizeBytes | bytes }}</p>
+    <p class="confirm__body">
+      This is permanent: the file is unlinked from
+      <code class="font-mono">{{ modelsDir() }}</code> rather than moved anywhere, the space it
+      holds comes back, and having it again means downloading it again.
+    </p>
+    @if (count > 1) {
+      <p class="confirm__body">
+        A split model is useless one shard at a time, so all {{ count }} of its files go together:
+      </p>
+      <ul class="confirm__shards font-mono">
+        @for (shard of model.shards; track shard) {
+          <li>{{ shard }}</li>
+        }
+      </ul>
+    }
+    <div class="confirm__actions">
+      <button type="button" class="btn btn-quiet" autofocus (click)="confirmDialog.close()">
+        Keep it
+      </button>
+      <button type="button" class="btn btn-danger" (click)="confirmDelete()">
+        {{ count > 1 ? 'Delete ' + count + ' files' : 'Delete this file' }}
+      </button>
+    </div>
+  }
+</dialog>

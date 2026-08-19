@@ -154,6 +154,61 @@ describe("kvCacheMiB", () => {
 	test("no shape means no number, rather than a guess", () => {
 		expect(kvCacheMiB({ arch: "unknown", expertBytes: 0, tensorBytes: 0 }, 8192)).toBeUndefined();
 	});
+
+	/**
+	 * Read out of the real gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf header on
+	 * 2026-08-19: 30 layers, KV heads alternating 8/8/8/8/8/2, key and value
+	 * length 512, a 1024-token window on every layer the pattern marks, and 256
+	 * for those layers' heads.
+	 */
+	function gemma4() {
+		const heads: number[] = [];
+		const pattern: boolean[] = [];
+		for (let layer = 0; layer < 30; layer++) {
+			heads.push(layer % 6 === 5 ? 2 : 8);
+			pattern.push(layer % 6 !== 5);
+		}
+		return {
+			arch: "gemma4",
+			blockCount: 30,
+			headCount: 16,
+			headCountKvLayers: heads,
+			keyLength: 512,
+			valueLength: 512,
+			slidingWindow: 1024,
+			slidingWindowPattern: pattern,
+			keyLengthSwa: 256,
+			valueLengthSwa: 256,
+			expertBytes: 0,
+			tensorBytes: 0,
+		};
+	}
+
+	test("a windowed layer caches its window, not the whole context", () => {
+		// 25 windowed layers: 1024 tokens * 8 heads * (256+256) * 34/32.
+		// 5 full layers: 32768 tokens * 2 heads * (512+512) * 34/32.
+		const expected = (25 * 1024 * 8 * 512 * (34 / 32) + 5 * 32768 * 2 * 1024 * (34 / 32)) / MIB;
+		expect(kvCacheMiB(gemma4(), 32768)).toBeCloseTo(expected, 1);
+		// Under half a GiB. Charging every layer the full-attention shape gives
+		// 16320 MiB, which would report a model that runs as CPU-only.
+		expect(kvCacheMiB(gemma4(), 32768) ?? 0).toBeLessThan(512);
+	});
+
+	test("only the full-attention layers grow with context", () => {
+		const at32k = kvCacheMiB(gemma4(), 32768) ?? 0;
+		const at64k = kvCacheMiB(gemma4(), 65536) ?? 0;
+		// Windowed layers are already saturated at 1024 tokens, so doubling the
+		// context less than doubles the cache.
+		expect(at64k).toBeLessThan(at32k * 2);
+		expect(at64k).toBeGreaterThan(at32k);
+	});
+
+	test("a window with no published pattern is charged as full attention", () => {
+		const { slidingWindowPattern, ...withoutPattern } = gemma4();
+		expect(slidingWindowPattern.length).toBe(30);
+		// Overstating is the safe direction: nothing here invents which layers window.
+		expect(kvCacheMiB(withoutPattern, 32768) ?? 0).toBeGreaterThan(kvCacheMiB(gemma4(), 32768) ?? 0);
+	});
 });
 
 describe("real weights on this machine", () => {
