@@ -23,7 +23,7 @@ export interface CompletionContext {
 	commands: readonly string[];
 	/** Subcommands per slash command, e.g. { models: ["list", "switch", "info"] }. */
 	subcommands: Readonly<Record<string, readonly string[]>>;
-	/** Model profile keys. */
+	/** Model keys from `config.models`. */
 	modelKeys: readonly string[];
 	/** Absolute directory that bare relative paths complete against. */
 	cwd: string;
@@ -32,10 +32,9 @@ export interface CompletionContext {
 const WIN = process.platform === "win32";
 
 /** Sub-subcommands offered by the shell scripts, and by nothing else. */
-const CLI_COMMANDS: readonly string[] = ["engine", "sessions", "models", "completion"];
+const CLI_COMMANDS: readonly string[] = ["sessions", "models", "completion"];
 
 const CLI_SUBCOMMANDS: ReadonlyArray<readonly [string, readonly string[]]> = [
-	["engine", ["start", "stop", "status"]],
 	["sessions", ["list", "show", "rm"]],
 	["models", ["list", "use"]],
 	["completion", ["powershell", "bash"]],
@@ -53,7 +52,7 @@ const CLI_FLAGS: readonly string[] = [
 	"--resume",
 	"--cwd",
 	"--endpoint",
-	"--no-autostart",
+	"--context-window",
 	"--max-steps",
 	"-v",
 	"--verbose",
@@ -89,7 +88,7 @@ export function completeLine(line: string, ctx: CompletionContext): [string[], s
 			const subs = argIndex === 0 ? ctx.subcommands[cmd] : undefined;
 			if (subs !== undefined) return [pick(subs, token), token];
 
-			// 3. Places where a model profile key is expected.
+			// 3. Places where a model key is expected.
 			if (wantsModelKey(cmd, words, argIndex)) return [pick(ctx.modelKeys, token), token];
 		}
 	}

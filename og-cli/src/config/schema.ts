@@ -1,52 +1,39 @@
 /**
  * Configuration contract. Layered resolution order (later wins):
  *   defaults -> ~/.og/config.json -> <workspace>/.og/config.json -> OG_* env -> CLI flags
- * No localhost assumption is baked in: `endpoint` is always explicit so the same
- * build works against a shared LAN inference server.
+ * Nothing here describes an inference server's internals: og talks to an
+ * OpenAI-compatible endpoint over HTTP and never starts, stops or inspects one.
+ * Providing that endpoint is a separate concern (see ../../og-llama-cpp for one
+ * way to run a local llama.cpp server).
  */
 
-export interface ModelProfile {
-	/** GGUF filename relative to `engine.modelsDir`, or an absolute path. */
-	file: string;
-	/** KV cache context length passed to llama-server (-c). */
-	ctx: number;
-	/** Layers offloaded to GPU (-ngl). 99 = all. */
-	nGpuLayers: number;
-	/** MoE expert layers kept on CPU (--n-cpu-moe). Omit for dense models. */
-	nCpuMoe?: number;
-	cacheTypeK: "f16" | "q8_0" | "q4_0";
-	cacheTypeV: "f16" | "q8_0" | "q4_0";
-	flashAttn: boolean;
-	/** Logical context window the agent budgets against; <= ctx. */
+/** One model og can talk to over an OpenAI-compatible API. */
+export interface ModelSpec {
+	/** Value sent as the OpenAI `model` field. Defaults to the record key. */
+	id?: string;
+	/** Per-model endpoint override; falls back to the top-level `endpoint`. */
+	endpoint?: string;
+	/**
+	 * Name of the environment variable holding this model's bearer token, so a
+	 * config file never has to contain a secret. Falls back to `apiKey`.
+	 */
+	apiKeyEnv?: string;
+	/** Extra request headers, e.g. a gateway's attribution headers. */
+	headers?: Record<string, string>;
+	/** Usable context window in tokens; the agent budgets and compacts against it. */
 	contextWindow: number;
-	/** Sampling defaults recommended by the model authors. */
-	temperature: number;
+	/** Per-model response cap; falls back to `agent.maxTokens`. */
+	maxTokens?: number;
+	/** Sent only when set; falls back to `agent.temperature`. */
+	temperature?: number;
 	topP?: number;
+	/**
+	 * llama.cpp / vLLM sampling extensions. OpenAI's own API rejects unknown
+	 * request fields, so leave these unset for OpenAI proper.
+	 */
 	topK?: number;
 	minP?: number;
 	repeatPenalty?: number;
-	/** Extra raw llama-server args. */
-	extraArgs?: string[];
-}
-
-export interface EngineConfig {
-	/** Start llama-server automatically when `endpoint` is unreachable. */
-	autoStart: boolean;
-	/** Directory containing llama-server.exe. */
-	binDir: string;
-	/** Directory containing GGUF weights. */
-	modelsDir: string;
-	host: string;
-	port: number;
-	/** CPU threads for non-offloaded work. */
-	threads: number;
-	/** Logical batch size (-b) and physical micro-batch (-ub). */
-	batchSize: number;
-	ubatchSize: number;
-	/** Parallel server slots (--parallel). */
-	slots: number;
-	/** Seconds to wait for /health to report ok. */
-	startupTimeoutSec: number;
 }
 
 export type ApprovalPolicy = "always" | "never" | "unsafe-only";
@@ -85,10 +72,9 @@ export interface OgConfig {
 	/** OpenAI-compatible base URL, e.g. http://127.0.0.1:8127 */
 	endpoint: string;
 	apiKey?: string;
-	/** Active profile key in `profiles`. */
+	/** Active key in `models`. */
 	model: string;
-	profiles: Record<string, ModelProfile>;
-	engine: EngineConfig;
+	models: Record<string, ModelSpec>;
 	agent: AgentConfig;
 	tools: ToolsConfig;
 	/** Directory for sessions.db and logs. */

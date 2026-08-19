@@ -136,7 +136,7 @@ describe("tool line formatters", () => {
 describe("wrap", () => {
 	test("never exceeds the requested width for plain text", () => {
 		const text =
-			"The engine supervisor starts llama-server with measured profile arguments and waits for /health to report ok before the agent sends its first request.";
+			"The provider streams server-sent events from an OpenAI-compatible endpoint and the agent budgets every request against the active model spec's context window before it sends the first token.";
 		for (const width of [20, 32, 40, 72]) {
 			for (const line of wrap(text, width).split("\n")) {
 				expect(visibleWidth(line)).toBeLessThanOrEqual(width);

@@ -11,6 +11,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { bashCompletion, completeLine, powershellCompletion, type CompletionContext } from "../src/ui/completion.ts";
+import { COMMAND_NAMES, COMMAND_SUBCOMMANDS } from "../src/ui/tui.ts";
 
 const FLAGS = [
 	"-p",
@@ -24,7 +25,7 @@ const FLAGS = [
 	"--resume",
 	"--cwd",
 	"--endpoint",
-	"--no-autostart",
+	"--context-window",
 	"--max-steps",
 	"-v",
 	"--verbose",
@@ -116,17 +117,17 @@ describe("subcommands", () => {
 });
 
 describe("model keys", () => {
-	test("/models switch completes profile keys", () => {
+	test("/models switch completes model keys", () => {
 		const [matches, substring] = complete("/models switch ");
 		expect(matches).toEqual(["qwen3-coder", "gpt-oss-20b", "glm-4.6"]);
 		expect(substring).toBe("");
 	});
 
-	test("/models info narrows profile keys by prefix", () => {
+	test("/models info narrows model keys by prefix", () => {
 		expect(complete("/models info g")[0]).toEqual(["gpt-oss-20b", "glm-4.6"]);
 	});
 
-	test("/model completes profile keys directly", () => {
+	test("/model completes model keys directly", () => {
 		const [matches, substring] = complete("/model qwen");
 		expect(matches).toEqual(["qwen3-coder"]);
 		expect(substring).toBe("qwen");
@@ -134,6 +135,37 @@ describe("model keys", () => {
 
 	test("an unrelated subcommand does not leak model keys", () => {
 		expect(complete("/models list q")[0]).toEqual([]);
+	});
+});
+
+describe("slash vocabulary lockstep", () => {
+	/**
+	 * `/help`, the dispatcher and Tab completion all read `COMMAND_NAMES`, so a
+	 * command cannot be half-registered. Driving the completer from the real
+	 * arrays is what proves the removed `/engine` command is gone everywhere
+	 * rather than merely hidden from one of the three readers.
+	 */
+	const real: CompletionContext = {
+		commands: COMMAND_NAMES,
+		subcommands: COMMAND_SUBCOMMANDS,
+		modelKeys: ["qwen3-coder-30b"],
+		cwd: process.cwd(),
+	};
+
+	test("Tab offers exactly the registered commands", () => {
+		expect(completeLine("/", real)[0]).toEqual(COMMAND_NAMES.map((name) => `/${name}`));
+	});
+
+	test("the engine command is not registered anywhere", () => {
+		expect(COMMAND_NAMES).not.toContain("engine");
+		expect(completeLine("/en", real)[0]).toEqual([]);
+		expect(completeLine("/engine", real)[0]).toEqual([]);
+	});
+
+	test("every declared subcommand set belongs to a declared command", () => {
+		for (const command of Object.keys(COMMAND_SUBCOMMANDS)) {
+			expect(COMMAND_NAMES, command).toContain(command);
+		}
 	});
 });
 
@@ -255,14 +287,40 @@ describe("shell scripts", () => {
 		["bash", bashCompletion()],
 	] as const;
 
+	/** Vocabulary the CLI actually has, mirrored from completion.ts. */
+	const WORDS = [
+		"sessions",
+		"models",
+		"completion",
+		"list",
+		"show",
+		"rm",
+		"use",
+		"powershell",
+		"bash",
+	] as const;
+
+	/**
+	 * Vocabulary the engine cutover removed. `start` needs a word-ish boundary
+	 * because PowerShell's own `.StartsWith(` contains it.
+	 */
+	const REMOVED = ["engine", "start", "stop", "status", "autostart"] as const;
+
 	for (const [kind, script] of scripts) {
 		test(`${kind} script names the binary, is ASCII, and covers every flag`, () => {
 			expect(script.length).toBeGreaterThan(200);
 			expect(script).toContain("og");
 			expect(/^[\x09\x0a\x0d\x20-\x7e]*$/.test(script)).toBe(true);
-			for (const flag of FLAGS) expect(script).toContain(flag);
-			for (const word of ["engine", "sessions", "models", "completion", "start", "stop", "status", "list", "show", "rm", "use", "powershell", "bash"]) {
-				expect(script).toContain(word);
+			for (const flag of FLAGS) expect(script, flag).toContain(flag);
+			for (const word of WORDS) expect(script, word).toContain(word);
+		});
+
+		test(`${kind} script offers nothing og no longer has`, () => {
+			expect(script).not.toContain("--no-autostart");
+			for (const word of REMOVED) {
+				// Matches the word only where a vocabulary token can live: quoted,
+				// space-separated inside a quoted list, or a shell `case` label.
+				expect(script, word).not.toMatch(new RegExp(`(^|[\\s'(])${word}($|[\\s')])`));
 			}
 		});
 
@@ -271,6 +329,13 @@ describe("shell scripts", () => {
 			expect(custom).toContain("ogx");
 		});
 	}
+
+	test("both shells are generated from one flag list, in one order", () => {
+		expect(bashCompletion()).toContain(`local flags='${FLAGS.join(" ")}'`);
+		expect(powershellCompletion()).toContain(
+			`$flags = @(${FLAGS.map((flag) => `'${flag}'`).join(",")})`,
+		);
+	});
 
 	test("powershell registers a native completer and never invokes the binary", () => {
 		const script = powershellCompletion();

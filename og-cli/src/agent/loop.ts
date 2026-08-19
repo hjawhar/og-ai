@@ -11,6 +11,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
+import { modelSpecOf } from "../config/load.ts";
 import type { OgConfig, ApprovalPolicy } from "../config/schema.ts";
 import type { ChatRequest, Message, Provider, ToolCall, ToolSpec } from "../provider/types.ts";
 import { ProviderError } from "../provider/types.ts";
@@ -247,6 +248,13 @@ class OgAgent implements Agent {
 	private messages: Message[] = [];
 	private tokens: number[] = [];
 	private hasUserTurn = false;
+	/**
+	 * Sampling for every turn, resolved once. The model spec wins over
+	 * `agent.*`: it describes the model, while `agent.*` is og's own default for
+	 * models that say nothing. Extensions absent from the spec stay absent from
+	 * the body, because OpenAI rejects request fields it does not know.
+	 */
+	private readonly sampling: Pick<ChatRequest, "temperature" | "maxTokens" | "topP" | "topK" | "minP" | "repeatPenalty">;
 
 	constructor(deps: AgentDeps) {
 		this.deps = deps;
@@ -259,6 +267,16 @@ class OgAgent implements Agent {
 		}));
 		const declared = deps.provider.contextWindow;
 		this.window = Number.isFinite(declared) && declared > 0 ? declared : 8192;
+
+		const spec = modelSpecOf(deps.config);
+		this.sampling = {
+			temperature: spec.temperature ?? deps.config.agent.temperature,
+			maxTokens: spec.maxTokens ?? deps.config.agent.maxTokens,
+			...(spec.topP === undefined ? {} : { topP: spec.topP }),
+			...(spec.topK === undefined ? {} : { topK: spec.topK }),
+			...(spec.minP === undefined ? {} : { minP: spec.minP }),
+			...(spec.repeatPenalty === undefined ? {} : { repeatPenalty: spec.repeatPenalty }),
+		};
 
 		const stored = deps.store.messages(deps.sessionId);
 		if (stored.length > 0) {
@@ -393,8 +411,7 @@ class OgAgent implements Agent {
 			try {
 				const req: ChatRequest = {
 					messages: this.messages.slice(),
-					temperature: this.deps.config.agent.temperature,
-					maxTokens: this.deps.config.agent.maxTokens,
+					...this.sampling,
 					signal: state.signal,
 				};
 				if (this.specs.length > 0) req.tools = this.specs;

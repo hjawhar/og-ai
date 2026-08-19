@@ -1,7 +1,8 @@
 /**
- * Configuration decides which weights load and how much VRAM they take, so a
- * layering bug does not crash — it silently changes model behaviour or spills to
- * host RAM at 1/8th throughput.
+ * Configuration decides which endpoint is dialled, which wire model name is
+ * sent and how many tokens the agent believes it may spend, so a layering bug
+ * does not crash — it silently talks to the wrong server or overruns the
+ * server's real context window and gets the prompt truncated behind og's back.
  *
  * `src/config/load.ts` captures `os.homedir()` at module load, so the home layer
  * cannot be redirected inside an already-loaded process. Every `loadConfig` case
@@ -15,8 +16,15 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { DEFAULT_CONFIG } from "../src/config/load.ts";
-import type { OgConfig, ModelProfile } from "../src/config/schema.ts";
+import {
+	DEFAULT_CONFIG,
+	DEFAULT_CONTEXT_WINDOW,
+	endpointOf,
+	modelSpecOf,
+	wireModelOf,
+} from "../src/config/load.ts";
+import { ConfigError } from "../src/config/schema.ts";
+import type { ModelSpec, OgConfig } from "../src/config/schema.ts";
 
 const REPO_ROOT = path.resolve(import.meta.dir, "..");
 const LOAD_MODULE = path.join(REPO_ROOT, "src", "config", "load.ts");
@@ -39,9 +47,11 @@ try {
 	const cfg = load.loadConfig({
 		workspaceRoot: spec.workspaceRoot,
 		...(spec.overrides ? { overrides: spec.overrides } : {}),
+		...(spec.contextWindow !== undefined ? { contextWindow: spec.contextWindow } : {}),
 	});
 	out.config = cfg;
-	if (spec.profileKey !== undefined) out.profile = load.profileOf(cfg, spec.profileKey);
+	out.hasEngineKey = Object.hasOwn(cfg, "engine");
+	if (spec.modelSpecKey !== undefined) out.modelSpec = load.modelSpecOf(cfg, spec.modelSpecKey);
 	out.ok = true;
 } catch (err) {
 	out.name = err instanceof Error ? err.name : typeof err;
@@ -57,7 +67,8 @@ interface CaseResult {
 	homedir: string;
 	defaultsUnchanged: boolean;
 	config?: OgConfig;
-	profile?: ModelProfile;
+	hasEngineKey?: boolean;
+	modelSpec?: ModelSpec;
 	name?: string;
 	message?: string;
 	isConfigError?: boolean;
@@ -70,7 +81,9 @@ interface CaseSpec {
 	ws?: unknown;
 	env?: Record<string, string>;
 	overrides?: Record<string, unknown>;
-	profileKey?: string;
+	/** Forwarded as `loadConfig({ contextWindow })`, i.e. `--context-window`. */
+	contextWindow?: number;
+	modelSpecKey?: string;
 }
 
 const roots: string[] = [];
@@ -109,7 +122,8 @@ function resolveConfig(spec: CaseSpec): CaseResult {
 			schemaModule: SCHEMA_MODULE,
 			workspaceRoot,
 			...(spec.overrides ? { overrides: spec.overrides } : {}),
-			...(spec.profileKey !== undefined ? { profileKey: spec.profileKey } : {}),
+			...(spec.contextWindow !== undefined ? { contextWindow: spec.contextWindow } : {}),
+			...(spec.modelSpecKey !== undefined ? { modelSpecKey: spec.modelSpecKey } : {}),
 		}),
 	);
 
@@ -140,10 +154,10 @@ function resolveConfig(spec: CaseSpec): CaseResult {
 	return parsed;
 }
 
-function profileOrThrow(cfg: OgConfig | undefined, key: string): ModelProfile {
-	const profile = cfg?.profiles[key];
-	if (!profile) throw new Error(`resolved config is missing profile ${key}`);
-	return profile;
+function specOrThrow(cfg: OgConfig | undefined, key: string): ModelSpec {
+	const spec = cfg?.models[key];
+	if (!spec) throw new Error(`resolved config is missing model ${key}`);
+	return spec;
 }
 
 describe("layer precedence", () => {
@@ -164,23 +178,30 @@ describe("layer precedence", () => {
 	});
 
 	test("home layer alone is applied when no workspace config exists", () => {
-		const result = resolveConfig({ home: { model: "devstral-24b", engine: { port: 8500 } } });
+		const result = resolveConfig({
+			home: { model: "devstral-24b", endpoint: "https://api.example.com/v1-compat" },
+		});
 		expect(result.config?.model).toBe("devstral-24b");
-		expect(result.config?.engine.port).toBe(8500);
-		expect(result.config?.engine.host).toBe(DEFAULT_CONFIG.engine.host);
+		expect(result.config?.endpoint).toBe("https://api.example.com/v1-compat");
+		// Every shipped model survives a scalar patch elsewhere.
+		expect(Object.keys(result.config?.models ?? {}).sort()).toEqual(
+			Object.keys(DEFAULT_CONFIG.models).sort(),
+		);
 	});
 
-	test("a profile patch merges per key and leaves sibling profiles intact", () => {
+	test("a model patch merges per key and leaves sibling models intact", () => {
 		const result = resolveConfig({
-			ws: { profiles: { "qwen3-coder-30b": { nCpuMoe: 12 } } },
+			ws: { models: { "qwen3-coder-30b": { contextWindow: 16384 } } },
 		});
 
-		const patched = profileOrThrow(result.config, "qwen3-coder-30b");
-		const original = DEFAULT_CONFIG.profiles["qwen3-coder-30b"] as ModelProfile;
-		expect(patched).toEqual({ ...original, nCpuMoe: 12 });
-		expect(Object.keys(result.config?.profiles ?? {}).sort()).toEqual(
-			Object.keys(DEFAULT_CONFIG.profiles).sort(),
+		const patched = specOrThrow(result.config, "qwen3-coder-30b");
+		const original = DEFAULT_CONFIG.models["qwen3-coder-30b"] as ModelSpec;
+		expect(patched).toEqual({ ...original, contextWindow: 16384 });
+		expect(Object.keys(result.config?.models ?? {}).sort()).toEqual(
+			Object.keys(DEFAULT_CONFIG.models).sort(),
 		);
+		// The sibling it shares sampling defaults with is untouched.
+		expect(specOrThrow(result.config, "qwen3-coder-30b-long").contextWindow).toBe(65536);
 	});
 
 	test("arrays replace instead of concatenating", () => {
@@ -212,7 +233,6 @@ describe("environment layer", () => {
 				OG_MODEL: "devstral-24b",
 				OG_API_KEY: "env-key",
 				OG_STATE_DIR: "C:\\env-state",
-				OG_NO_AUTOSTART: "1",
 			},
 		});
 
@@ -220,17 +240,20 @@ describe("environment layer", () => {
 		expect(result.config?.model).toBe("devstral-24b");
 		expect(result.config?.apiKey).toBe("env-key");
 		expect(result.config?.stateDir).toBe("C:\\env-state");
-		expect(result.config?.engine.autoStart).toBe(false);
-		// The autostart flag is a nested patch: it must not wipe the rest of `engine`.
-		expect(result.config?.engine.port).toBe(DEFAULT_CONFIG.engine.port);
-		expect(result.config?.engine.binDir).toBeTruthy();
 	});
 
-	test("falsey OG_NO_AUTOSTART values leave autostart enabled", () => {
-		for (const value of ["0", "false", "no", "off", ""]) {
-			const result = resolveConfig({ env: { OG_NO_AUTOSTART: value } });
-			expect(result.config?.engine.autoStart).toBe(true);
-		}
+	test("only those four variables exist: an OG_* knob og dropped is inert", () => {
+		// og no longer starts a server, so there is nothing to opt out of. The
+		// variable must be ignored outright rather than resurrect a hidden branch.
+		// `stateDir` is derived from each case's own temp home, so it is the one
+		// field two runs cannot agree on.
+		const shape = (result: CaseResult): string =>
+			JSON.stringify({ ...result.config, stateDir: "" });
+
+		const bare = resolveConfig({});
+		const withGhosts = resolveConfig({ env: { OG_NO_AUTOSTART: "1", OG_LOCAL_ENDPOINT: "1" } });
+		expect(withGhosts.ok).toBe(true);
+		expect(shape(withGhosts)).toBe(shape(bare));
 	});
 
 	test("explicit overrides beat the environment layer", () => {
@@ -246,6 +269,90 @@ describe("environment layer", () => {
 		const result = resolveConfig({ overrides: { agent: { maxSteps: 3 } } });
 		expect(result.config?.agent.maxSteps).toBe(3);
 		expect(result.config?.agent.contextReservePct).toBe(DEFAULT_CONFIG.agent.contextReservePct);
+	});
+});
+
+describe("pass-through models", () => {
+	test("`-m` names a model og has never heard of and it is synthesized", () => {
+		const result = resolveConfig({
+			overrides: { model: "gpt-4o", endpoint: "https://api.openai.com" },
+			modelSpecKey: "gpt-4o",
+		});
+
+		expect(result.ok).toBe(true);
+		expect(result.config?.model).toBe("gpt-4o");
+		expect(result.modelSpec).toEqual({ id: "gpt-4o", contextWindow: DEFAULT_CONTEXT_WINDOW });
+		// The shipped entries are still there to switch back to.
+		expect(Object.keys(result.config?.models ?? {})).toHaveLength(
+			Object.keys(DEFAULT_CONFIG.models).length + 1,
+		);
+	});
+
+	test("OG_MODEL is equally explicit and synthesizes too", () => {
+		const result = resolveConfig({
+			env: { OG_MODEL: "claude-sonnet-4", OG_ENDPOINT: "https://gateway.local:8080" },
+			modelSpecKey: "claude-sonnet-4",
+		});
+		expect(result.ok).toBe(true);
+		expect(result.modelSpec).toEqual({ id: "claude-sonnet-4", contextWindow: DEFAULT_CONTEXT_WINDOW });
+	});
+
+	test("`--context-window` sizes a synthesized model", () => {
+		const result = resolveConfig({
+			overrides: { model: "gpt-4o" },
+			contextWindow: 128_000,
+			modelSpecKey: "gpt-4o",
+		});
+		expect(result.modelSpec).toEqual({ id: "gpt-4o", contextWindow: 128_000 });
+	});
+
+	test("`--context-window` also overrides a configured model's window", () => {
+		const result = resolveConfig({ contextWindow: 12_288, modelSpecKey: "qwen3-coder-30b" });
+		expect(result.config?.model).toBe("qwen3-coder-30b");
+		expect(result.modelSpec?.contextWindow).toBe(12_288);
+		// Only the active model is resized; its siblings keep their measured windows.
+		expect(specOrThrow(result.config, "qwen3-coder-30b-long").contextWindow).toBe(65536);
+		// The sampling knobs of the configured entry survive the resize.
+		expect(result.modelSpec?.topK).toBe(20);
+	});
+
+	test("an unknown `model` in a config file is still a typo, not a pass-through", () => {
+		const typo = { model: "qwen3-codre-30b" };
+		for (const spec of [{ home: typo }, { ws: typo }]) {
+			const result = resolveConfig(spec);
+			expect(result.ok).toBe(false);
+			expect(result.isConfigError).toBe(true);
+			expect(result.message).toContain("`model`");
+			expect(result.message).toContain("qwen3-codre-30b");
+			expect(result.message).toContain("is not a known model");
+		}
+		// Not even `--context-window` turns a file typo into a pass-through name.
+		const sized = resolveConfig({ ws: { model: "qwen3-codre-30b" }, contextWindow: 4096 });
+		expect(sized.isConfigError).toBe(true);
+	});
+
+	test("an explicit `-m` overrides a file typo instead of inheriting the error", () => {
+		const result = resolveConfig({
+			ws: { model: "qwen3-codre-30b" },
+			overrides: { model: "devstral-24b" },
+		});
+		expect(result.ok).toBe(true);
+		expect(result.config?.model).toBe("devstral-24b");
+	});
+
+	test("a synthesized model still carries the config's endpoint and key", () => {
+		const result = resolveConfig({
+			overrides: { model: "kimi-k2" },
+			env: { OG_ENDPOINT: "https://openrouter.ai/api", OG_API_KEY: "sk-test" },
+		});
+		expect(result.ok).toBe(true);
+		expect(result.config?.endpoint).toBe("https://openrouter.ai/api");
+		expect(result.config?.apiKey).toBe("sk-test");
+		// Synthesis adds nothing but the wire id and the window.
+		expect(Object.keys(result.config?.models["kimi-k2"] ?? {}).sort()).toEqual([
+			"contextWindow",
+			"id",
+		]);
 	});
 });
 
@@ -277,27 +384,127 @@ describe("validation", () => {
 		expect(result.message).toContain("not a url");
 	});
 
-	test("an unknown model names the available profiles", () => {
+	test("an unknown model names the available models", () => {
 		const result = resolveConfig({ ws: { model: "gpt-oss-20b" } });
 		expect(result.isConfigError).toBe(true);
 		expect(result.message).toContain("`model`");
 		expect(result.message).toContain("gpt-oss-20b");
-		for (const key of Object.keys(DEFAULT_CONFIG.profiles)) expect(result.message).toContain(key);
+		for (const key of Object.keys(DEFAULT_CONFIG.models)) expect(result.message).toContain(key);
 	});
 
-	test("contextWindow larger than ctx is rejected with the profile path", () => {
-		const result = resolveConfig({ ws: { profiles: { "qwen3-coder-30b": { contextWindow: 40000 } } } });
-		expect(result.isConfigError).toBe(true);
-		expect(result.message).toContain("`profiles.qwen3-coder-30b.contextWindow`");
-		expect(result.message).toContain("32768");
-	});
+	test("contextWindow is the one required field of a model spec", () => {
+		// Absent: a spec that declares nothing else is still rejected.
+		const absent = resolveConfig({ ws: { models: { custom: { topP: 0.5 } } } });
+		expect(absent.isConfigError).toBe(true);
+		expect(absent.message).toContain("`models.custom.contextWindow`");
+		expect(absent.message).toContain("must be a positive number");
 
-	test("non-positive ctx is rejected with the profile path", () => {
-		for (const ctx of [0, -1]) {
-			const result = resolveConfig({ ws: { profiles: { "devstral-24b": { ctx } } } });
-			expect(result.isConfigError).toBe(true);
-			expect(result.message).toContain("`profiles.devstral-24b.ctx`");
+		// Non-positive and non-numeric windows are the same failure.
+		for (const contextWindow of [0, -1, "32768", null, true]) {
+			const result = resolveConfig({ ws: { models: { custom: { contextWindow } } } });
+			expect(result.isConfigError, JSON.stringify(contextWindow)).toBe(true);
+			expect(result.message).toContain("`models.custom.contextWindow`");
 		}
+	});
+
+	test("a model spec needing nothing but contextWindow loads and can be selected", () => {
+		const result = resolveConfig({
+			ws: { model: "house-model", models: { "house-model": { contextWindow: 16384 } } },
+			modelSpecKey: "house-model",
+		});
+		expect(result.ok).toBe(true);
+		expect(result.modelSpec).toEqual({ contextWindow: 16384 });
+	});
+
+	test("id and apiKeyEnv must be non-empty strings when present", () => {
+		for (const field of ["id", "apiKeyEnv"] as const) {
+			for (const value of ["", 7, null]) {
+				const result = resolveConfig({
+					ws: { models: { custom: { contextWindow: 8192, [field]: value } } },
+				});
+				expect(result.isConfigError, `${field}=${JSON.stringify(value)}`).toBe(true);
+				expect(result.message).toContain(`\`models.custom.${field}\``);
+				expect(result.message).toContain("must be a non-empty string");
+			}
+		}
+	});
+
+	test("a per-model endpoint must be a non-empty string that parses as a URL", () => {
+		const empty = resolveConfig({ ws: { models: { custom: { contextWindow: 8192, endpoint: "" } } } });
+		expect(empty.isConfigError).toBe(true);
+		expect(empty.message).toContain("`models.custom.endpoint`");
+		expect(empty.message).toContain("must be a non-empty string");
+
+		// `URL` accepts a surprising amount ("api.example.com:443" parses as a
+		// scheme), so the rejection case has to be something it truly refuses.
+		const notUrl = resolveConfig({
+			ws: { models: { custom: { contextWindow: 8192, endpoint: "not a url" } } },
+		});
+		expect(notUrl.isConfigError).toBe(true);
+		expect(notUrl.message).toContain("`models.custom.endpoint`");
+		expect(notUrl.message).toContain("is not a valid URL");
+
+		const valid = resolveConfig({
+			ws: {
+				model: "custom",
+				models: { custom: { contextWindow: 8192, endpoint: "https://api.example.com/v1-compat" } },
+			},
+			modelSpecKey: "custom",
+		});
+		expect(valid.ok).toBe(true);
+		expect(valid.modelSpec?.endpoint).toBe("https://api.example.com/v1-compat");
+	});
+
+	test("sampling knobs must be finite numbers", () => {
+		for (const field of ["maxTokens", "temperature", "topP", "topK", "minP", "repeatPenalty"] as const) {
+			const result = resolveConfig({
+				ws: { models: { custom: { contextWindow: 8192, [field]: "0.5" } } },
+			});
+			expect(result.isConfigError, field).toBe(true);
+			expect(result.message).toContain(`\`models.custom.${field}\``);
+			expect(result.message).toContain("must be a finite number");
+		}
+	});
+
+	test("header values must be strings, and the offending header is named", () => {
+		const result = resolveConfig({
+			ws: { models: { custom: { contextWindow: 8192, headers: { "HTTP-Referer": 1 } } } },
+		});
+		expect(result.isConfigError).toBe(true);
+		expect(result.message).toContain("`models.custom.headers.HTTP-Referer`");
+
+		const ok = resolveConfig({
+			ws: {
+				model: "custom",
+				models: {
+					custom: { contextWindow: 8192, headers: { "HTTP-Referer": "https://og.local" } },
+				},
+			},
+			modelSpecKey: "custom",
+		});
+		expect(ok.ok).toBe(true);
+		expect(ok.modelSpec?.headers).toEqual({ "HTTP-Referer": "https://og.local" });
+	});
+
+	test("a `models` patch can never delete an entry: an empty record is a no-op", () => {
+		// Merging means `"models": {}` cannot leave og with nothing to dial, from
+		// either a file or a flag. Deleting a model means editing the record it
+		// came from, not shadowing it with emptiness.
+		const specs: CaseSpec[] = [{ ws: { models: {} } }, { overrides: { models: {} } }];
+		for (const spec of specs) {
+			const result = resolveConfig(spec);
+			expect(result.ok).toBe(true);
+			expect(Object.keys(result.config?.models ?? {}).sort()).toEqual(
+				Object.keys(DEFAULT_CONFIG.models).sort(),
+			);
+		}
+	});
+
+	test("apiKey must be a non-empty string when present", () => {
+		const result = resolveConfig({ ws: { apiKey: 12345 } });
+		expect(result.isConfigError).toBe(true);
+		expect(result.message).toContain("`apiKey`");
+		expect(result.message).toContain("must be a non-empty string");
 	});
 
 	test("contextReservePct outside (0, 0.9) is rejected", () => {
@@ -316,56 +523,67 @@ describe("validation", () => {
 		}
 	});
 
-	test("a profile without a file is rejected", () => {
-		const result = resolveConfig({ ws: { profiles: { custom: { file: "", ctx: 8192, contextWindow: 8192 } } } });
-		expect(result.isConfigError).toBe(true);
-		expect(result.message).toContain("`profiles.custom.file`");
-	});
-
 	test("denyPaths must be an array", () => {
 		const result = resolveConfig({ ws: { tools: { denyPaths: "**/*.pem" } } });
 		expect(result.isConfigError).toBe(true);
 		expect(result.message).toContain("`tools.denyPaths`");
 	});
+});
 
-	test("profileOf rejects an unknown key and lists the known ones", () => {
-		const result = resolveConfig({ profileKey: "ghost-model" });
-		expect(result.ok).toBe(false);
-		expect(result.isConfigError).toBe(true);
-		expect(result.message).toContain('unknown model profile "ghost-model"');
-		expect(result.message).toContain("qwen3-coder-30b");
+describe("modelSpecOf", () => {
+	test("defaults to the active model", () => {
+		const active = DEFAULT_CONFIG.models[DEFAULT_CONFIG.model];
+		expect(active).toBeDefined();
+		expect(modelSpecOf(DEFAULT_CONFIG)).toBe(active as ModelSpec);
 	});
 
-	test("profileOf returns the requested profile when it exists", () => {
-		const result = resolveConfig({ profileKey: "qwen3-coder-30b-fast" });
-		expect(result.ok).toBe(true);
-		expect(result.profile).toEqual(DEFAULT_CONFIG.profiles["qwen3-coder-30b-fast"] as ModelProfile);
-	});
-
-	test("a valid custom profile can be added and selected", () => {
-		const result = resolveConfig({
-			ws: {
-				model: "custom",
-				profiles: {
-					custom: {
-						file: "Custom-Q4.gguf",
-						ctx: 16384,
-						nGpuLayers: 99,
-						cacheTypeK: "q8_0",
-						cacheTypeV: "q8_0",
-						flashAttn: true,
-						contextWindow: 16384,
-						temperature: 0.2,
-					},
-				},
-			},
-			profileKey: "custom",
-		});
-		expect(result.ok).toBe(true);
-		expect(result.profile?.ctx).toBe(16384);
-		expect(Object.keys(result.config?.profiles ?? {})).toHaveLength(
-			Object.keys(DEFAULT_CONFIG.profiles).length + 1,
+	test("returns the requested spec when it exists", () => {
+		expect(modelSpecOf(DEFAULT_CONFIG, "qwen3-coder-30b-fast")).toEqual(
+			DEFAULT_CONFIG.models["qwen3-coder-30b-fast"] as ModelSpec,
 		);
+	});
+
+	test("rejects an unknown key as a ConfigError listing the known ones", () => {
+		let err: unknown;
+		try {
+			modelSpecOf(DEFAULT_CONFIG, "ghost-model");
+		} catch (caught) {
+			err = caught;
+		}
+		expect(err).toBeInstanceOf(ConfigError);
+		expect((err as Error).message).toContain('unknown model "ghost-model"');
+		for (const key of Object.keys(DEFAULT_CONFIG.models)) {
+			expect((err as Error).message).toContain(key);
+		}
+	});
+
+	test("resolves a model synthesized by the pass-through path", () => {
+		const result = resolveConfig({ overrides: { model: "mystery-7b" }, modelSpecKey: "mystery-7b" });
+		expect(result.modelSpec).toEqual({ id: "mystery-7b", contextWindow: DEFAULT_CONTEXT_WINDOW });
+	});
+});
+
+describe("wire model and endpoint resolution", () => {
+	const cfg: OgConfig = {
+		...DEFAULT_CONFIG,
+		endpoint: "http://127.0.0.1:8127",
+		model: "aliased",
+		models: {
+			aliased: { id: "Qwen/Qwen3-Coder-30B-A3B-Instruct", contextWindow: 32768 },
+			hosted: { endpoint: "https://api.deepseek.com", contextWindow: 65536 },
+			plain: { contextWindow: 8192 },
+		},
+	};
+
+	test("an explicit id is the wire name; otherwise the record key is", () => {
+		expect(wireModelOf(cfg)).toBe("Qwen/Qwen3-Coder-30B-A3B-Instruct");
+		expect(wireModelOf(cfg, "plain")).toBe("plain");
+	});
+
+	test("a per-model endpoint wins over the top-level one", () => {
+		expect(endpointOf(cfg, "hosted")).toBe("https://api.deepseek.com");
+		expect(endpointOf(cfg, "plain")).toBe("http://127.0.0.1:8127");
+		expect(endpointOf(cfg)).toBe("http://127.0.0.1:8127");
 	});
 });
 
@@ -374,57 +592,103 @@ describe("DEFAULT_CONFIG invariants", () => {
 		// Every resolveConfig() case asserts defaultsUnchanged; this pins the
 		// hardest case, where nested objects and arrays are both patched.
 		const result = resolveConfig({
-			home: { profiles: { "qwen3-coder-30b": { nCpuMoe: 20 } }, tools: { denyPaths: [] } },
+			home: { models: { "qwen3-coder-30b": { topK: 40 } }, tools: { denyPaths: [] } },
 			ws: { agent: { maxSteps: 2 } },
-			overrides: { engine: { slots: 4 } },
+			overrides: { models: { "devstral-24b": { maxTokens: 4096 } } },
 		});
 		expect(result.defaultsUnchanged).toBe(true);
-		expect(result.config?.engine.slots).toBe(4);
+		expect(result.config?.models["qwen3-coder-30b"]?.topK).toBe(40);
+		expect(result.config?.models["devstral-24b"]?.maxTokens).toBe(4096);
+		expect(DEFAULT_CONFIG.models["qwen3-coder-30b"]?.topK).toBe(20);
+		expect(DEFAULT_CONFIG.models["devstral-24b"]?.maxTokens).toBeUndefined();
 	});
 
-	test("every profile is internally consistent and VRAM-plausible", () => {
-		const KV_TYPES: Record<string, true> = { f16: true, q8_0: true, q4_0: true };
-		for (const [key, profile] of Object.entries(DEFAULT_CONFIG.profiles)) {
-			expect(profile.contextWindow, key).toBeLessThanOrEqual(profile.ctx);
-			expect(profile.contextWindow, key).toBeGreaterThan(0);
-			expect(profile.nGpuLayers, key).toBeGreaterThan(0);
-			expect(KV_TYPES[profile.cacheTypeK] === true, key).toBe(true);
-			expect(KV_TYPES[profile.cacheTypeV] === true, key).toBe(true);
-			// The measured VRAM sweep assumed flash attention on; off changes the budget.
-			expect(profile.flashAttn, key).toBe(true);
-			expect(profile.file.endsWith(".gguf"), key).toBe(true);
-			expect(path.basename(profile.file), key).toBe(profile.file);
-		}
-	});
-
-	test("the default model key exists and MoE splits match the measured sweep", () => {
-		expect(DEFAULT_CONFIG.profiles[DEFAULT_CONFIG.model]).toBeDefined();
-		const measured: Record<string, { ctx: number; nCpuMoe?: number }> = {
-			"qwen3-coder-30b": { ctx: 32768, nCpuMoe: 14 },
-			"qwen3-coder-30b-long": { ctx: 65536, nCpuMoe: 18 },
-			"qwen3-coder-30b-fast": { ctx: 32768, nCpuMoe: 4 },
-			"devstral-24b": { ctx: 8192 },
+	test("exactly the four measured operating points ship, with their measured windows", () => {
+		// Copied from og-llama-cpp/docs/benchmarks.md; changing one here without a
+		// re-run there makes the record a lie.
+		const measured: Record<string, number> = {
+			"qwen3-coder-30b": 32768,
+			"qwen3-coder-30b-long": 65536,
+			"qwen3-coder-30b-fast": 32768,
+			"devstral-24b": 8192,
 		};
-		for (const [key, expected] of Object.entries(measured)) {
-			const profile = DEFAULT_CONFIG.profiles[key];
-			expect(profile?.ctx, key).toBe(expected.ctx);
-			expect(profile?.nCpuMoe, key).toBe(expected.nCpuMoe);
+		expect(Object.keys(DEFAULT_CONFIG.models).sort()).toEqual(Object.keys(measured).sort());
+		for (const [key, contextWindow] of Object.entries(measured)) {
+			expect(DEFAULT_CONFIG.models[key]?.contextWindow, key).toBe(contextWindow);
+		}
+		expect(DEFAULT_CONFIG.models[DEFAULT_CONFIG.model]).toBeDefined();
+	});
+
+	test("no shipped model pins a temperature: agent.temperature governs", () => {
+		// Qwen recommends 0.7 for chat, but tool-call JSON degrades there; 0.2 was
+		// what the CLI actually sent before, and it stays the single source.
+		for (const [key, spec] of Object.entries(DEFAULT_CONFIG.models)) {
+			expect(spec.temperature, key).toBeUndefined();
+		}
+		expect(DEFAULT_CONFIG.agent.temperature).toBe(0.2);
+	});
+
+	test("og knows nothing about weights, servers or offload splits", () => {
+		// Scoped to the model record on purpose: `stateDir` is derived from the
+		// developer's home directory and is not og's statement about anything.
+		const text = JSON.stringify(DEFAULT_CONFIG.models);
+		for (const forbidden of [
+			"gguf",
+			"file",
+			"nCpuMoe",
+			"nGpuLayers",
+			"cacheType",
+			"flashAttn",
+			"binDir",
+			"modelsDir",
+			"port",
+			"autoStart",
+		]) {
+			expect(text.toLowerCase(), forbidden).not.toContain(forbidden.toLowerCase());
+		}
+		// No engine section exists to be revived, on the defaults or a resolved config.
+		expect(Object.hasOwn(DEFAULT_CONFIG, "engine")).toBe(false);
+		expect(resolveConfig({}).hasEngineKey).toBe(false);
+		// A model spec carries only client-side fields.
+		const ALLOWED_SPEC_FIELDS: Record<string, true> = {
+			id: true,
+			endpoint: true,
+			apiKeyEnv: true,
+			headers: true,
+			contextWindow: true,
+			maxTokens: true,
+			temperature: true,
+			topP: true,
+			topK: true,
+			minP: true,
+			repeatPenalty: true,
+		};
+		for (const [key, spec] of Object.entries(DEFAULT_CONFIG.models)) {
+			for (const field of Object.keys(spec)) {
+				expect(ALLOWED_SPEC_FIELDS[field] === true, `${key}.${field}`).toBe(true);
+			}
 		}
 	});
 
-	test("the default endpoint and the engine port agree", () => {
-		expect(new URL(DEFAULT_CONFIG.endpoint).port).toBe(String(DEFAULT_CONFIG.engine.port));
+	test("the pass-through window is conservative enough to be safe anywhere", () => {
+		expect(DEFAULT_CONTEXT_WINDOW).toBe(32768);
+		// A guessed window larger than the server's real one is a silent prompt
+		// truncation, so the fallback stays at the most common local ceiling and
+		// `--context-window` exists for anything bigger. It must still be large
+		// enough to hold a response: maxTokens alone would leave no room to think.
+		expect(DEFAULT_CONTEXT_WINDOW).toBeGreaterThan(DEFAULT_CONFIG.agent.maxTokens);
+	});
+
+	test("the default endpoint is a loopback URL: og ships pointing at nothing remote", () => {
+		const url = new URL(DEFAULT_CONFIG.endpoint);
+		expect(url.hostname).toBe("127.0.0.1");
+		expect(url.port).toBe("8127");
+		expect(DEFAULT_CONFIG.apiKey).toBeUndefined();
 	});
 
 	test("compaction triggers no later than the context reserve boundary", () => {
 		const { compactThresholdPct, contextReservePct } = DEFAULT_CONFIG.agent;
 		expect(compactThresholdPct).toBeGreaterThan(0);
 		expect(compactThresholdPct).toBeLessThanOrEqual(1 - contextReservePct);
-	});
-
-	test("the batch geometry llama-server requires holds", () => {
-		expect(DEFAULT_CONFIG.engine.ubatchSize).toBeLessThanOrEqual(DEFAULT_CONFIG.engine.batchSize);
-		expect(DEFAULT_CONFIG.engine.slots).toBeGreaterThanOrEqual(1);
-		expect(DEFAULT_CONFIG.engine.threads).toBeGreaterThanOrEqual(4);
 	});
 });

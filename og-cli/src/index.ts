@@ -1,18 +1,20 @@
 #!/usr/bin/env bun
 /**
- * og — local-first agentic coding CLI.
+ * og — agentic coding CLI for any OpenAI-compatible endpoint.
  *
  * Heavy modules are imported dynamically so `--help`, `--version` and argument
- * errors never touch sqlite, the provider or the engine supervisor.
+ * errors never touch sqlite or the provider. og never starts an inference
+ * server: point `endpoint` at one that is already listening (see
+ * ../../og-llama-cpp for a local llama.cpp server).
  */
 
 import manifest from "../package.json" with { type: "json" };
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import type { Agent } from "./agent/types.ts";
 import { ConfigError, type OgConfig } from "./config/schema.ts";
 import type { ApprovalRequest } from "./tools/types.ts";
-import { bold, cyan, decideApproval, dim, elapsed, formatBytes, formatError, formatWarn, green, red } from "./ui/render.ts";
+import { bold, cyan, decideApproval, dim, formatError, green, red } from "./ui/render.ts";
 import { EXIT_ERROR, EXIT_OK, type ApprovalHandler, type RebuildRequest, type RebuildResult, type UiDeps } from "./ui/types.ts";
 
 interface Flags {
@@ -20,12 +22,12 @@ interface Flags {
 	print: boolean;
 	promptParts: string[];
 	continueLatest: boolean;
-	noAutostart: boolean;
 	verbose: boolean;
 	model?: string;
 	resume?: string;
 	cwd?: string;
 	endpoint?: string;
+	contextWindow?: number;
 	maxSteps?: number;
 }
 
@@ -35,7 +37,6 @@ type Command =
 	| { kind: "models"; action: "list" }
 	| { kind: "models"; action: "use"; key: string }
 	| { kind: "completion"; shell: "powershell" | "bash" }
-	| { kind: "engine"; action: "start" | "stop" | "status" }
 	| { kind: "sessions"; action: "list" }
 	| { kind: "sessions"; action: "show" | "rm"; id: string }
 	| { kind: "chat" };
@@ -45,12 +46,9 @@ interface ParsedArgs {
 	flags: Flags;
 }
 
-const ENGINE_ACTIONS = ["start", "stop", "status"] as const;
 const SESSION_ACTIONS = ["list", "show", "rm"] as const;
 const MODELS_ACTIONS = ["list", "use"] as const;
 const COMPLETION_SHELLS = ["powershell", "bash"] as const;
-/** Below this free VRAM the CUDA driver starts spilling weights to host RAM. */
-const VRAM_HEADROOM_WARN_MIB = 700;
 
 function parseArgs(argv: readonly string[]): ParsedArgs {
 	const flags: Flags = {
@@ -58,7 +56,6 @@ function parseArgs(argv: readonly string[]): ParsedArgs {
 		print: false,
 		promptParts: [],
 		continueLatest: false,
-		noAutostart: false,
 		verbose: false,
 	};
 	const positional: string[] = [];
@@ -120,9 +117,15 @@ function parseArgs(argv: readonly string[]): ParsedArgs {
 				case "endpoint":
 					flags.endpoint = valueFor("--endpoint", inline);
 					break;
-				case "no-autostart":
-					flags.noAutostart = true;
+				case "context-window": {
+					const raw = valueFor("--context-window", inline);
+					const parsed = Number.parseInt(raw, 10);
+					if (!Number.isFinite(parsed) || parsed < 1) {
+						throw new ConfigError(`--context-window expects a positive integer, got "${raw}"`);
+					}
+					flags.contextWindow = parsed;
 					break;
+				}
 				case "max-steps": {
 					const raw = valueFor("--max-steps", inline);
 					const parsed = Number.parseInt(raw, 10);
@@ -209,13 +212,6 @@ function parseArgs(argv: readonly string[]): ParsedArgs {
 		}
 		return { command: { kind: "completion", shell }, flags };
 	}
-	if (subcommandAllowed && head === "engine") {
-		const action = positional[1] ?? "status";
-		if (!ENGINE_ACTIONS.includes(action as (typeof ENGINE_ACTIONS)[number])) {
-			throw new ConfigError(`og engine expects ${ENGINE_ACTIONS.join("|")}, got "${action}"`);
-		}
-		return { command: { kind: "engine", action: action as (typeof ENGINE_ACTIONS)[number] }, flags };
-	}
 	if (subcommandAllowed && head === "sessions") {
 		const raw = positional[1] ?? "list";
 		const action = SESSION_ACTIONS.find((candidate) => candidate === raw);
@@ -233,32 +229,33 @@ function parseArgs(argv: readonly string[]): ParsedArgs {
 }
 
 function helpText(version: string): string {
-	return `${bold("og")} ${version} — local-first agentic coding CLI
+	return `${bold("og")} ${version} — agentic coding CLI for any OpenAI-compatible endpoint
 
 ${bold("usage")}
   og [options] [prompt...]              interactive REPL, or one-shot when a prompt is given
   og -p "fix the failing test"          headless run, assistant text on stdout
-  og engine start|stop|status           manage the local llama.cpp server
   og sessions list|show <id>|rm <id>    inspect stored sessions
-  og models [list]                      list model profiles with size and availability
-  og models use <key>                   set the default model profile
+  og models [list]                      list configured models with endpoint and window
+  og models use <key>                   set the default model
   og completion powershell|bash         print a shell completion script
 
 ${bold("options")}
-  -p, --print [prompt]   headless (non-interactive) run; reads stdin when piped
-      --json             emit JSONL agent events plus a final result line (implies -p)
-  -m, --model <profile>  model profile key to use
-  -c, --continue         continue the latest session for this directory
-  -r, --resume <id>      resume a specific session
-      --cwd <dir>        run against another directory
-      --endpoint <url>   OpenAI-compatible base URL of the inference server
-      --no-autostart     never launch llama-server; fail if the endpoint is down
-      --max-steps <n>    cap model turns for this run
-  -v, --verbose          reasoning, turn boundaries and raw error stacks
-      --version          print version
-  -h, --help             this text
+  -p, --print [prompt]      headless (non-interactive) run; reads stdin when piped
+      --json                emit JSONL agent events plus a final result line (implies -p)
+  -m, --model <name>        a configured model key, or any name the endpoint serves
+  -c, --continue            continue the latest session for this directory
+  -r, --resume <id>         resume a specific session
+      --cwd <dir>           run against another directory
+      --endpoint <url>      OpenAI-compatible base URL to talk to
+      --context-window <n>  tokens to budget for this model
+      --max-steps <n>       cap model turns for this run
+  -v, --verbose             reasoning, turn boundaries and raw error stacks
+      --version             print version
+  -h, --help                this text
 
 ${bold("notes")}
+  og never starts a server: run one first, e.g. the og-llama-cpp project's ${dim("serve.ts")}.
+  Secrets belong in the environment: ${dim("OG_API_KEY")}, or ${dim("apiKeyEnv")} per model.
   Piped stdin is used as the prompt: ${dim("git diff | og -p 'review this'")}
   Tab completes commands, model keys and paths inside the REPL.
   Shell completion: ${
@@ -288,25 +285,9 @@ function findWorkspaceRoot(start: string): string {
 	}
 }
 
-/** Runs `work` while printing a one-line elapsed-seconds note to stderr. */
-async function withProgress<T>(label: string, work: Promise<T>): Promise<T> {
-	const err = process.stderr;
-	const tty = err.isTTY === true;
-	const startedAt = Date.now();
-	if (!tty) err.write(`${label}\n`);
-	const timer = tty ? setInterval(() => err.write(`\r\u001b[2K${dim(`${label} ${((Date.now() - startedAt) / 1000).toFixed(0)}s`)}`), 500) : undefined;
-	try {
-		return await work;
-	} finally {
-		clearInterval(timer);
-		if (tty) err.write("\r\u001b[2K");
-	}
-}
-
 async function main(): Promise<number> {
 	const { command, flags } = parseArgs(process.argv.slice(2));
 	const out = process.stdout;
-	const err = process.stderr;
 
 	if (command.kind === "help") {
 		out.write(`${helpText(readVersion())}\n`);
@@ -317,7 +298,7 @@ async function main(): Promise<number> {
 		return EXIT_OK;
 	}
 	if (command.kind === "completion") {
-		// Shell completion must work before any config or engine exists.
+		// Shell completion must work before any config exists.
 		const { bashCompletion, powershellCompletion } = await import("./ui/completion.ts");
 		out.write(`${command.shell === "powershell" ? powershellCompletion("og") : bashCompletion("og")}\n`);
 		return EXIT_OK;
@@ -328,20 +309,21 @@ async function main(): Promise<number> {
 	const workspaceRoot = findWorkspaceRoot(cwd);
 
 	// Lazy on purpose: --help/--version and argument errors must not load config,
-	// sqlite, the provider or the engine supervisor.
+	// sqlite or the provider.
 	const { loadConfig } = await import("./config/load.ts");
 	const overrides: Partial<OgConfig> = {};
 	if (flags.endpoint !== undefined) overrides.endpoint = flags.endpoint;
 	if (flags.model !== undefined) overrides.model = flags.model;
-	const config = loadConfig(Object.keys(overrides).length === 0 ? { workspaceRoot } : { workspaceRoot, overrides });
+	const config = loadConfig({
+		workspaceRoot,
+		...(Object.keys(overrides).length === 0 ? {} : { overrides }),
+		...(flags.contextWindow === undefined ? {} : { contextWindow: flags.contextWindow }),
+	});
 
 	if (command.kind === "models") {
-		// Lazy: `og models` needs the path resolver but never the engine or store.
-		const { resolveModelPath } = await import("./engine/args.ts");
-
 		if (command.action === "use") {
-			if (config.profiles[command.key] === undefined) {
-				throw new ConfigError(`unknown profile "${command.key}"; available: ${Object.keys(config.profiles).join(", ")}`);
+			if (config.models[command.key] === undefined) {
+				throw new ConfigError(`unknown model "${command.key}"; available: ${Object.keys(config.models).join(", ")}`);
 			}
 			// Persisted at machine level so every workspace picks it up; a workspace
 			// `.og/config.json` still wins, which is the documented layering.
@@ -355,28 +337,24 @@ async function main(): Promise<number> {
 			mkdirSync(config.stateDir, { recursive: true });
 			writeFileSync(file, `${JSON.stringify(existing, null, 2)}\n`, "utf8");
 			out.write(`default model \u2192 ${bold(command.key)} ${dim(`(written to ${file})`)}\n`);
-			const { EngineSupervisor } = await import("./engine/supervisor.ts");
-			const status = await new EngineSupervisor(config).status();
-			if (status.running && status.model !== undefined && status.model !== command.key) {
-				out.write(`${dim(`engine is still serving "${status.model}" — run \`og engine stop\` to load the new weights`)}\n`);
-			}
 			return EXIT_OK;
 		}
 
-		out.write(`${dim(`models dir ${config.engine.modelsDir}`)}\n`);
-		for (const [key, profile] of Object.entries(config.profiles)) {
+		for (const [key, spec] of Object.entries(config.models)) {
 			const mark = key === config.model ? green("*") : " ";
-			let state: string;
-			try {
-				const path = resolveModelPath(config, key);
-				state = `${green("present")} ${formatBytes(statSync(path).size)} ${dim(path)}`;
-			} catch (error) {
-				state = `${red("missing")} ${dim(error instanceof Error ? error.message : String(error))}`;
-			}
-			out.write(`${mark} ${bold(key.padEnd(22))} ${state}\n`);
-			out.write(`  ${dim(`ctx ${profile.ctx} \u00b7 window ${profile.contextWindow} \u00b7 ngl ${profile.nGpuLayers}${profile.nCpuMoe === undefined ? "" : ` \u00b7 n-cpu-moe ${profile.nCpuMoe}`} \u00b7 kv ${profile.cacheTypeK}/${profile.cacheTypeV} \u00b7 temp ${profile.temperature}`)}\n`);
+			const knobs = [`window ${spec.contextWindow}`];
+			if (spec.maxTokens !== undefined) knobs.push(`max-tokens ${spec.maxTokens}`);
+			if (spec.temperature !== undefined) knobs.push(`temp ${spec.temperature}`);
+			if (spec.topP !== undefined) knobs.push(`top-p ${spec.topP}`);
+			if (spec.topK !== undefined) knobs.push(`top-k ${spec.topK}`);
+			if (spec.minP !== undefined) knobs.push(`min-p ${spec.minP}`);
+			if (spec.repeatPenalty !== undefined) knobs.push(`repeat-penalty ${spec.repeatPenalty}`);
+			// The variable name, never its value: og prints config, not secrets.
+			if (spec.apiKeyEnv !== undefined) knobs.push(`key from $${spec.apiKeyEnv}`);
+			out.write(`${mark} ${bold(key.padEnd(22))} ${dim(`${spec.id ?? key} @ ${spec.endpoint ?? config.endpoint}`)}\n`);
+			out.write(`  ${dim(knobs.join(" \u00b7 "))}\n`);
 		}
-		out.write(`${dim("og models use <key> sets the default; /models switch <key> changes it for one session")}\n`);
+		out.write(`${dim("og models use <key> sets the default; -m <name> accepts any model the endpoint serves")}\n`);
 		return EXIT_OK;
 	}
 
@@ -384,39 +362,6 @@ async function main(): Promise<number> {
 	const { openSessionStore } = await import("./session/store.ts");
 	const store = openSessionStore(config.stateDir);
 	try {
-		const { EngineSupervisor } = await import("./engine/supervisor.ts");
-		const supervisor = new EngineSupervisor(config);
-
-		if (command.kind === "engine") {
-			if (command.action === "status") {
-				const status = await supervisor.status();
-				out.write(`${status.running ? green("running") : red("stopped")} ${status.endpoint}\n`);
-				if (status.model !== undefined) out.write(`${dim(`model ${status.model}`)}\n`);
-				if (status.pid !== undefined) out.write(`${dim(`pid ${status.pid}`)}\n`);
-				if (status.vramUsedMiB !== undefined) {
-					const total = status.vramTotalMiB;
-					out.write(`${dim(`vram ${status.vramUsedMiB}${total === undefined ? "" : ` / ${total}`} MiB`)}\n`);
-				}
-				if (flags.verbose) out.write(`${dim(supervisor.commandLine())}\n`);
-				return status.running ? EXIT_OK : EXIT_ERROR;
-			}
-			if (command.action === "stop") {
-				// stop() refuses to kill a server og did not launch; report that verbatim.
-				try {
-					await supervisor.stop();
-				} catch (error) {
-					err.write(`${formatError(error instanceof Error ? error.message : String(error))}\n`);
-					return EXIT_ERROR;
-				}
-				out.write("engine stopped\n");
-				return EXIT_OK;
-			}
-			const startedAt = Date.now();
-			const result = await withProgress("starting engine…", supervisor.ensureRunning());
-			out.write(`${result.started ? `engine started in ${elapsed(Date.now() - startedAt)}` : "engine already running"} at ${result.endpoint}\n`);
-			return EXIT_OK;
-		}
-
 		if (command.kind === "sessions") {
 			if (command.action === "list") {
 				const records = store.list({ limit: 20 });
@@ -447,32 +392,24 @@ async function main(): Promise<number> {
 			return EXIT_OK;
 		}
 
-		if (!flags.noAutostart) {
-			const result = await withProgress("starting engine…", supervisor.ensureRunning());
-			if (result.started) err.write(`${dim(`engine ready at ${result.endpoint}`)}\n`);
-			// A near-full GPU means the driver is paging weights to host RAM, which
-			// costs roughly 8x throughput while still "working". Warn, don't fail.
-			const status = await supervisor.status();
-			if (status.vramUsedMiB !== undefined && status.vramTotalMiB !== undefined) {
-				const headroom = status.vramTotalMiB - status.vramUsedMiB;
-				if (headroom < VRAM_HEADROOM_WARN_MIB) {
-					err.write(
-						`${formatWarn(
-							`only ${headroom} MiB of VRAM free (${status.vramUsedMiB}/${status.vramTotalMiB} MiB used). ` +
-								`The driver may spill to host RAM and run ~8x slower. Close GPU-heavy apps, ` +
-								`raise nCpuMoe for profile "${config.model}", or switch to a smaller profile.`,
-						)}\n`,
-					);
-				}
-			}
-		}
-
 		const { createProvider } = await import("./provider/registry.ts");
 		const { createTools } = await import("./tools/registry.ts");
 		const { createAgent } = await import("./agent/loop.ts");
 
 		let provider = createProvider(config);
 		const tools = createTools(config);
+
+		// One preflight instead of a mid-stream surprise: a transport failure means
+		// nothing is listening, which is a different problem from a server that
+		// answers and then rejects the request.
+		const health = await provider.health();
+		if (!health.reachable) {
+			throw new ConfigError(
+				`no server answering at ${provider.endpoint} (${health.detail ?? "connection failed"}). ` +
+					`Start one and retry — the og-llama-cpp project's \`bun run serve.ts\` runs a local llama.cpp server — ` +
+					`or point og elsewhere with --endpoint.`,
+			);
+		}
 
 		let approvalHandler: ApprovalHandler | null = null;
 		const approve = (req: ApprovalRequest): Promise<boolean> => (approvalHandler === null ? Promise.resolve(decideApproval(config, req)) : approvalHandler(req));
@@ -492,11 +429,8 @@ async function main(): Promise<number> {
 			createAgent({ config, provider, tools, store, sessionId, workspaceRoot, cwd, approve });
 
 		const rebuild = async (req: RebuildRequest): Promise<RebuildResult> => {
-			let engineRestartRequired = false;
 			if (req.model !== undefined && req.model !== config.model) {
-				const next = config.profiles[req.model];
-				if (next === undefined) throw new ConfigError(`unknown profile "${req.model}"`);
-				engineRestartRequired = config.profiles[config.model]?.file !== next.file;
+				if (config.models[req.model] === undefined) throw new ConfigError(`unknown model "${req.model}"`);
 				config.model = req.model;
 				provider = createProvider(config);
 			}
@@ -507,7 +441,7 @@ async function main(): Promise<number> {
 				if (store.get(selector.id) === undefined) throw new ConfigError(`no session "${selector.id}"`);
 				sessionId = selector.id;
 			}
-			return { agent: buildAgent(), sessionId, model: config.model, engineRestartRequired };
+			return { agent: buildAgent(), sessionId, model: config.model };
 		};
 
 		const stdinPiped = process.stdin.isTTY !== true;
@@ -520,7 +454,6 @@ async function main(): Promise<number> {
 		const ui: UiDeps = {
 			config,
 			agent: buildAgent(),
-			supervisor,
 			store,
 			sessionId,
 			workspaceRoot,

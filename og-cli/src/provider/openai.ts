@@ -1,11 +1,12 @@
 /**
- * OpenAI-compatible streaming provider. Targets llama.cpp's `--jinja` server
- * (native tool calls, /health, /tokenize) but degrades cleanly against any other
- * OpenAI-shaped endpoint.
+ * OpenAI-compatible streaming provider. The only thing in og that speaks to an
+ * inference server: it never spawns, supervises or introspects one, so a local
+ * llama.cpp server, OpenAI itself and any gateway are interchangeable here.
  */
 
 import type {
 	ChatRequest,
+	EndpointHealth,
 	FinishReason,
 	Message,
 	Provider,
@@ -92,18 +93,20 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 export class OpenAIProvider implements Provider {
 	readonly id: string;
 	readonly model: string;
+	/** Trailing slashes trimmed once so every route concatenation is exact. */
+	readonly endpoint: string;
 	readonly contextWindow: number;
 	readonly nativeToolCalls: boolean;
 
-	private readonly endpoint: string;
 	private readonly apiKey: string | undefined;
-	/** Flipped off permanently once /tokenize proves unavailable. */
-	private tokenizerAvailable = true;
+	private readonly extraHeaders: Record<string, string> | undefined;
 
 	constructor(opts: {
 		endpoint: string;
 		model: string;
 		apiKey?: string;
+		/** Extra request headers, e.g. a gateway's attribution headers. */
+		headers?: Record<string, string>;
 		contextWindow: number;
 		nativeToolCalls?: boolean;
 		id: string;
@@ -111,13 +114,19 @@ export class OpenAIProvider implements Provider {
 		this.endpoint = opts.endpoint.replace(/\/+$/, "");
 		this.model = opts.model;
 		this.apiKey = opts.apiKey;
+		this.extraHeaders = opts.headers;
 		this.contextWindow = opts.contextWindow;
 		this.nativeToolCalls = opts.nativeToolCalls ?? true;
 		this.id = opts.id;
 	}
 
+	/**
+	 * Configured headers are applied first so neither they nor a stray `apiKey`
+	 * can displace the content type or the bearer token og computed.
+	 */
 	private headers(): Record<string, string> {
-		const headers: Record<string, string> = { "content-type": "application/json" };
+		const headers: Record<string, string> = { ...this.extraHeaders };
+		headers["content-type"] = "application/json";
 		if (this.apiKey) headers["authorization"] = `Bearer ${this.apiKey}`;
 		return headers;
 	}
@@ -138,6 +147,10 @@ export class OpenAIProvider implements Provider {
 		if (req.tools && req.tools.length > 0) body["tools"] = req.tools.map(specToWire);
 		if (req.temperature !== undefined) body["temperature"] = req.temperature;
 		if (req.maxTokens !== undefined) body["max_tokens"] = req.maxTokens;
+		if (req.topP !== undefined) body["top_p"] = req.topP;
+		if (req.topK !== undefined) body["top_k"] = req.topK;
+		if (req.minP !== undefined) body["min_p"] = req.minP;
+		if (req.repeatPenalty !== undefined) body["repeat_penalty"] = req.repeatPenalty;
 		if (req.stop && req.stop.length > 0) body["stop"] = req.stop;
 
 		let res: Response;
@@ -329,42 +342,20 @@ export class OpenAIProvider implements Provider {
 		yield { type: "done", finishReason: mapFinishReason(rawFinish, sawToolCalls) };
 	}
 
-	async countTokens(text: string): Promise<number> {
-		if (this.tokenizerAvailable) {
-			try {
-				const res = await fetch(`${this.endpoint}/tokenize`, {
-					method: "POST",
-					headers: this.headers(),
-					body: JSON.stringify({ content: text }),
-				});
-				if (res.ok) {
-					const frame = asRecord(await res.json());
-					const tokens = frame?.["tokens"];
-					if (Array.isArray(tokens)) return tokens.length;
-				}
-				this.tokenizerAvailable = false;
-			} catch {
-				this.tokenizerAvailable = false;
-			}
-		}
-		return Math.ceil(text.length / 3.6);
-	}
-
-	async health(): Promise<boolean> {
-		try {
-			const res = await fetch(`${this.endpoint}/health`, { headers: this.headers() });
-			if (res.ok) {
-				const frame = asRecord(await res.json());
-				if (frame?.["status"] === "ok") return true;
-			}
-		} catch {
-			// Fall through to the generic OpenAI probe.
-		}
+	/**
+	 * Reachability, not readiness: any HTTP answer (401, 404 included) proves
+	 * something is listening, which is the only distinction a preflight can make
+	 * without guessing a server's error vocabulary. `/v1/models` is the probe
+	 * because every OpenAI-compatible server exposes it, llama.cpp included; a
+	 * second route would add nothing, since a transport failure fails per host
+	 * rather than per path.
+	 */
+	async health(): Promise<EndpointHealth> {
 		try {
 			const res = await fetch(`${this.endpoint}/v1/models`, { headers: this.headers() });
-			return res.status === 200;
-		} catch {
-			return false;
+			return { reachable: true, status: res.status };
+		} catch (err) {
+			return { reachable: false, detail: err instanceof Error ? err.message : String(err) };
 		}
 	}
 }

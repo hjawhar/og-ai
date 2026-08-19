@@ -1,252 +1,180 @@
 # og operations runbook
 
-Written for whoever is holding the pager. Every command here is real on the reference box, which
-is now Ubuntu 26.04 (RTX 5070 Ti 16303 MiB, llama.cpp b10488); the same machine ran Windows 11 Pro
-build 26200 before that, and the Windows recipes below are from that install. The captured VRAM
-figures and `print_timing` transcripts in this document come from the Windows-era runs on this
-same GPU and have not been re-measured under Linux — the card and the build are unchanged, so they
-remain the right expectations, but treat them as unverified on Linux. From a source checkout,
-substitute `bun run src/index.ts` for `og`.
+Written for whoever is holding the pager. `og` is a **client**: it sends OpenAI-compatible chat
+completions to `endpoint` and streams the reply. It does not start, adopt, restart or stop an
+inference server, it cannot see the GPU, and it has no engine state on disk. That makes this
+document short and the boundary sharp — anything about weights, VRAM, offload or a `llama-server`
+command line is diagnosed in the sibling [`../../og-llama-cpp`](../../og-llama-cpp) checkout, not
+here (§6).
+
+Every command below is real on the reference box, which is now Ubuntu 26.04 (RTX 5070 Ti
+16303 MiB, llama.cpp b10488); the same machine ran Windows 11 Pro build 26200 before that, and the
+PowerShell recipes are from that install. From a source checkout, substitute
+`bun run src/index.ts` for `og`.
 
 `og` is built, not installed from a registry: `bun run build` produces one self-contained
-`dist/og` that you copy onto `PATH`. See [`../README.md`](../README.md#install). Installing and
-upgrading the inference engine is a separate concern in a separate repository — the sibling
-checkout `../og-llama-cpp` — and its drill is
-[`../../og-llama-cpp/docs/upgrading.md`](../../og-llama-cpp/docs/upgrading.md).
+`dist/og` that you copy onto `PATH`. See [`../README.md`](../README.md#install).
 
 ---
 
-## 1. Start, stop, status
+## 1. Is the endpoint up?
+
+Two questions, and they are separate. **What is configured** is a local question `og` answers
+offline; **what is answering** is an HTTP question.
+
+```console
+$ og models
+* qwen3-coder-30b        qwen3-coder-30b @ http://127.0.0.1:8127
+  window 32768 · top-p 0.8 · top-k 20 · min-p 0 · repeat-penalty 1.05
+  gpt-4o                 gpt-4o @ https://api.openai.com
+  window 128000 · temp 0.2 · key from $OPENAI_API_KEY
+og models use <key> sets the default; -m <name> accepts any model the endpoint serves
+```
+
+`og models` opens no socket. It exits **0** with nothing listening anywhere, which is exactly what
+makes it the first command to run: it tells you the wire model id, the effective endpoint after
+per-model overrides, and which environment variable a key would come from — the three things
+people get wrong. A key's *value* is never printed, only its variable name.
+
+Then ask the endpoint itself. `og`'s own probe hits `GET {endpoint}/v1/models` first and falls back
+to `GET {endpoint}/health`, so those are the two URLs worth curling by hand:
 
 ```sh
-og engine start      # idempotent: adopts a healthy server, else spawns one
-og engine status     # health + model + pid + VRAM
-og engine status -v  # the same, plus the exact argv og would use
-og engine stop       # kills the process recorded in ~/.og/engine.json
+curl -sS http://127.0.0.1:8127/health
+# {"status":"ok"}
+
+# the model the server is actually serving, and the context it actually allocated
+curl -sS http://127.0.0.1:8127/v1/models | jq '.data[] | {id, n_ctx: .meta.n_ctx}'
+# { "id": "qwen-smoke", "n_ctx": 8192 }
+
+# a keyed endpoint: sending the header is what distinguishes 401 from "wrong URL"
+curl -sS -o /dev/null -w '%{http_code}\n' \
+  -H "Authorization: Bearer $OPENAI_API_KEY" https://api.openai.com/v1/models
 ```
 
-Healthy output:
+On Windows (PowerShell):
+
+```powershell
+(Invoke-WebRequest -SkipHttpErrorCheck http://127.0.0.1:8127/health).StatusCode
+(Invoke-RestMethod http://127.0.0.1:8127/v1/models).data |
+  Select-Object id, @{n = 'n_ctx'; e = { $_.meta.n_ctx } }
+```
+
+`llama-server`'s `/v1/models` carries more than the OpenAI schema requires, and the extra fields are
+the useful ones: `data[].id` is the `--alias` it was started with — the id your config must send —
+and `data[].meta.n_ctx` is the KV cache it really allocated, which is the number `contextWindow`
+has to fit inside. `meta.n_ctx_train` beside it is the model's trained maximum, which is *not* what
+is being served. `/health` answers `{"status":"ok"}` once the model is loaded, and is the readiness
+signal to poll on if you are scripting a start.
+
+### What `og` does before a run
+
+Exactly one `provider.health()` probe, and then it either proceeds or refuses:
 
 ```console
-$ og engine status
-running http://127.0.0.1:8127
-model qwen3-coder-30b
-pid 29060
-vram 15333 / 16303 MiB
+$ og -p "hello"
+error no server answering at http://127.0.0.1:8127 (Unable to connect. Is the computer able to
+access the url?). Start one and retry — the og-llama-cpp project's `bun run serve.ts` runs a
+local llama.cpp server — or point og elsewhere with --endpoint.
 ```
 
-Down:
+Two things to read off that. First, the preflight fails **only on transport failure** — connection
+refused, DNS failure, TLS failure, timeout. Any HTTP response at all counts as reachable, including
+`401`, `403`, `404` and `503`, and `og` proceeds so that the *server's own* error text reaches you
+instead of being replaced by a guess (§5).
 
-```console
-$ og engine status
-stopped http://127.0.0.1:8127
+Second, the parenthesised detail is Bun's `fetch` message passed through verbatim, and Bun collapses
+*every* transport failure into that same sentence: refused, unresolvable, TLS-rejected and timed-out
+all read identically. The message tells you the endpoint `og` dialled, not why the dial failed —
+`curl -v` against the same URL is what separates those cases.
+
+`og` has no subcommand that starts a server. Bring one up yourself, in its own terminal, and leave
+it there:
+
+```sh
+cd ../og-llama-cpp && bun run serve.ts --profile qwen3-coder-30b
 ```
 
-`og engine status` exits **0** when running and **1** when not, so it is directly usable as a
-health gate in a script: `og engine status >/dev/null || og engine start`.
-
-`og engine start` prints either `engine started in 12.4s at http://127.0.0.1:8127` or
-`engine already running at http://127.0.0.1:8127`. A cold start of the default 16.45 GiB Q4
-profile is the slow case; `engine.startupTimeoutSec` defaults to 240 s for that reason.
-
-The child is spawned **detached**, with stdout and stderr appended to `~/.og/engine.log`. The
-server therefore outlives the CLI — that is deliberate, and it is why the second `og` run of
-the day starts instantly.
+That process is the server's whole lifetime: it runs in the foreground with llama.cpp's log on your
+screen, and Ctrl-C kills the pid tree and frees the card. Nothing is detached, so a second `og` run
+of the day is fast only if that terminal is still open. Add `--dry-run` to see the exact argv
+without launching, and `--list` for the available operating points.
 
 ## 2. Where state lives
 
-`~/.og` (override with `OG_STATE_DIR` or `stateDir`):
+`~/.og` (override with `OG_STATE_DIR` or `stateDir`) — three files, none of them about a server:
 
 | File | Contents | Safe to delete? |
 | --- | --- | --- |
-| `config.json` | machine-level config overlay | yes, reverts to defaults |
+| `config.json` | machine-level config overlay; the file `og models use <key>` writes | yes, reverts to defaults |
 | `sessions.db` | `bun:sqlite` WAL database: sessions, messages, usage. `-wal` / `-shm` siblings appear while open | yes, loses all history |
-| `engine.json` | `{ pid, port, profile, startedAt }` for the server **og** launched | yes, but `og engine stop` then refuses to kill (see §3) |
-| `engine.log` | append-only `llama-server` stdout+stderr, with an `=== og: starting ... ===` banner per launch | yes, while the engine is stopped |
-| `engine.lock` | exclusive start lock; present only during a start | see §5 |
 | `history` | TUI prompt history, oldest first, capped; written on TUI exit | yes |
 
 Per-workspace overlay lives at `<workspace>/.og/config.json` and beats `~/.og/config.json`.
 
-### Reading engine.log
+There is no pid file, no lock file and no log file. `og` writes no log of its own: diagnostics go
+to stderr during the run, `--json` emits machine-readable events, and the *server's* log belongs to
+whichever terminal is running the server.
 
-```sh
-# tail
-tail -n 40 ~/.og/engine.log
-
-# follow live
-tail -n 20 -f ~/.og/engine.log
-
-# the launch banners: what was started, when, with which profile
-grep '=== og: starting' ~/.og/engine.log
-
-# per-request timings — this is the line that proves or disproves a spill
-grep print_timing ~/.og/engine.log | tail -n 12
-```
-
-On Windows (PowerShell):
-
-```powershell
-Get-Content -Tail 40 $env:USERPROFILE\.og\engine.log
-Get-Content -Tail 20 -Wait $env:USERPROFILE\.og\engine.log            # follow live
-Select-String '=== og: starting' $env:USERPROFILE\.og\engine.log      # launch banners
-Select-String print_timing $env:USERPROFILE\.og\engine.log | Select-Object -Last 12
-```
-
-A healthy `print_timing` block looks like this (prompt eval = prefill, eval = generation):
-
-```
-slot print_timing: id  0 | task 2744 | prompt eval time = 72.25 ms / 11 tokens (6.57 ms per token, 152.24 tokens per second)
-slot print_timing: id  0 | task 2744 |        eval time = 20.43 ms /  2 tokens (20.43 ms per token,  48.95 tokens per second)
-```
-
-Very short requests look slow per-token because of fixed overhead; judge throughput only on
-requests of a few hundred tokens or more. Other lines worth knowing: `load_tensors:` reports
-the CPU/GPU split (`--n-cpu-moe` at work), `llama_context: KV self size` reports the KV cache
-footprint, and `main: server is listening` is the readiness line `/health` corroborates.
-
-Startup failures are also surfaced inline: when a spawn dies or never becomes healthy, `og`
-raises an error containing the full command line plus the **last 20 non-empty lines** of
-`engine.log`, so you usually do not need to open the file at all.
-
-## 3. Adopting or reclaiming a server og did not launch
-
-The endpoint is authoritative: a healthy server at `cfg.endpoint` is always **adopted**,
-whether `og` started it, an earlier `og` run started it, or you launched it by hand. `og`
-never starts a second server, and `og engine status` will happily report an adopted one
-(without a `pid` line, since it has no record of it).
-
-`og engine stop` deliberately refuses to kill what it cannot identify:
+### Sessions
 
 ```console
-$ og engine stop
-error A server is answering at http://127.0.0.1:8127 but og has no record of starting it (~/.og/engine.json is absent), so its process cannot be identified. Stop it wherever it was launched.
+$ og sessions list
+d5a1d59d-c6fc-41e2-b0c5-7db7dd9e2033 2026-08-19 14:02 · qwen3-coder-30b · 5158 tok · /home/you/demo
+  add peek() to LruCache
 ```
-
-That is not a bug — killing an unknown PID on a shared box is worse than refusing. Reclaim it
-manually:
 
 ```sh
-# who owns the port?
-ss -ltnp 'sport = :8127'
-# State  Recv-Q Send-Q Local Address:Port  Peer Address:Port Process
-# LISTEN 0      4096       127.0.0.1:8127       0.0.0.0:*     users:(("llama-server",pid=29060,fd=30))
-
-# confirm it is really llama-server, and how long it has been up, before killing anything
-ps -o pid,lstart,cmd -p 29060
-
-# stop it; -9 only if it ignores SIGTERM
-kill 29060
-
-# then let og own the next one
-og engine start
+og sessions show <id>            # the full transcript, message by message, with tool calls
+og sessions rm <id>              # delete one session and its messages (cascades)
+og -c -p "..."                   # continue the newest session for this directory
+og -r <id> -p "..."              # resume a specific one
 ```
 
-On Windows (PowerShell):
+`sessions list` shows the **20 most recently updated sessions across every directory**, newest
+first: id, UTC timestamp of last activity, the model it ran on, cumulative tokens, and the cwd it
+was started in, with the title indented underneath once one has been derived from the first prompt.
+The cwd column is the one to read — `-c` resolves to the newest session *for the current
+directory*, so a `-c` in a different repo starts a fresh session rather than resuming someone
+else's work, even though both appear in this list.
 
-```powershell
-# who owns the port?
-Get-NetTCPConnection -LocalPort 8127 -State Listen | Select-Object OwningProcess
+Inside the TUI, `/sessions` and `/resume <id>` do the same, and `/clear` starts a fresh session
+without touching stored ones. A session records the model it ran on, which is why `/usage` can
+report per-model throughput without mixing two models.
 
-# confirm it is really llama-server, and how long it has been up, before killing anything
-Get-Process -Id 29060 | Select-Object Id, ProcessName, StartTime, Path
-
-# stop it; -Force only if it ignores the polite close
-Stop-Process -Id 29060
-```
-
-To take over an existing server *without* killing it, just point at it and disable autostart:
-`og --endpoint http://127.0.0.1:8127 --no-autostart -p "..."`. `og` will use it and never
-try to manage its lifecycle.
-
-## 4. VRAM spill — the diagnostic to run first
-
-**This is the failure mode that motivated the project.** It never throws, never logs an error,
-and never stops working. It just runs about eight times slower.
-
-### Symptom
-
-Generation collapses from 70-140 tok/s to roughly **15-30 tok/s**. Prefill collapses harder —
-from 1200-3000 tok/s to around **120 tok/s**. The pinned status row and `print_timing` in
-`engine.log` both show it. Nothing errors.
-
-### Cause
-
-Once resident VRAM passes **~15.4 GiB** on this 16303 MiB card, the NVIDIA driver's
-system-memory fallback starts paging weights to host RAM over PCIe. The measured cliff:
-
-| Config | VRAM (MiB) | Prefill (tok/s) | Generation (tok/s) | |
-| --- | --- | --- | --- | --- |
-| Q4 c32768 `--n-cpu-moe 10` | 15750 | 120 | 29.2 | **spilling** |
-| Q4 c32768 `--n-cpu-moe 12` | 15364 | 1644 | 88.5 | marginal |
-| Q4 c32768 `--n-cpu-moe 14` | 14714 | 1476 | 82.1 | safe (default) |
-
-386 MiB of extra resident memory between the second and first rows costs **13.7x prefill** and
-**3x generation**. There is no gentle degradation: you are either under the line or ruined.
-
-### Confirm
+## 3. Changing the model
 
 ```sh
-og engine status          # look at the vram line: used / total
-nvidia-smi                 # who else is on the GPU?
-nvidia-smi --query-gpu=memory.used,memory.total --format=csv
-nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv
+og models                            # what is configured, and where each entry's requests go
+og models use qwen3-coder-30b-fast   # persist the default to ~/.og/config.json
+og -m qwen3-coder-30b-fast -p "..."  # one run only
+og -m gpt-4o --endpoint https://api.openai.com --context-window 128000 -p "..."
 ```
 
-From inside the TUI, `/stats` reports the same GPU state plus the installed engine build, and
-`/usage` reports context occupancy, decode throughput and TTFT for the active profile:
+Inside the TUI, `/models list`, `/models info <key>` and `/models switch <key>` do the same for one
+session; a switch takes effect on the next prompt.
 
-```
-/stats     gpu 0  NVIDIA GeForce RTX 5070 Ti
-             vram █████████░ 95% 15474 / 16303 MiB
-/usage     last run  2 steps · 1.5s wall · decode 82.1 tok/s · ttft 1.2s
-```
+Two things to know:
 
-Free VRAM = total - used. Below **700 MiB free**, `og` prints a warning before the run:
+- **`og` does not reload anything.** A switch re-resolves the entry — wire id, endpoint, key and
+  headers — and rebuilds the HTTP client, which is why an entry pointing at a different backend
+  takes effect on the next prompt. What it never does is touch the server. If the endpoint is a
+  single-model `llama-server`, switching to a name it was not started with is a *server-side*
+  rejection, not an `og` failure; restart the server with the other profile (§1) if you actually
+  want different weights. There is no preflight on a switch either, so a switch to an unreachable
+  backend surfaces at the first request rather than at the switch.
+- **`og models use` writes only the `model` key**, and machine config is the *second* layer: a
+  `<workspace>/.og/config.json` with its own `model` still wins. If a `use` appears to do nothing,
+  check for a workspace override first.
 
-```
-warn only 640 MiB of VRAM free (15663/16303 MiB used). The driver may spill to host RAM and run ~8x slower. Close GPU-heavy apps, raise nCpuMoe for profile "qwen3-coder-30b", or switch to a smaller profile.
-```
+`-m` accepts any name, registered or not: an unknown one is synthesised as
+`{ id: <name>, contextWindow: 32768 }`, overridable with `--context-window`. That is the fast path
+for "does this gateway's model work at all?" without editing config. The same is true of `OG_MODEL`.
+A `model` in a **config file** gets no such pass — an unknown one there fails with
+`unknown model "..."; available: ...`, which is what catches a typo you would otherwise chase into
+the server's logs. `og models use <key>` validates against `config.models` for the same reason.
 
-Idle desktop use measured **968 MiB** on this card (Windows-era run; see the header note), so the
-working budget is ~15200 MiB and every shipped profile targets **>= 1.2 GiB free**.
-
-### Fix ladder — in this order
-
-1. **Close GPU consumers.** Browsers with hardware acceleration, Discord, OBS, another LLM
-   runner. `nvidia-smi --query-compute-apps=...` names them. This is free and instant, and it
-   is the most common actual cause: the profile was sized for a 968 MiB idle desktop.
-2. **Raise `nCpuMoe`** by 2 for the active profile and restart the engine. Each step moves more
-   MoE expert layers to the CPU. Measured cost of +2 on the Q4 32k profile: 15364 -> 14714 MiB
-   for 88.5 -> 82.1 tok/s. Cheap insurance; a spilling config is 3x worse than this.
-3. **Drop `ctx`.** KV cache at `q8_0` is linear in context: the Q4 profile needs
-   `--n-cpu-moe 18` at 65536 versus 14 at 32768 to stay under the line. Halving `ctx` buys back
-   several hundred MiB with zero throughput cost on requests that fit.
-4. **Switch profile.** `qwen3-coder-30b-fast` (Q3_K_XL, 14569 MiB, 2957 / 136.5 tok/s) is the
-   smallest and fastest Qwen option; `devstral-24b` (15045 MiB, 8k window) is a dense
-   alternative. `og -m qwen3-coder-30b-fast ...`, or `/models switch qwen3-coder-30b-fast` in the TUI.
-
-After any profile change: `og engine stop; og engine start; og engine status` and confirm
-the VRAM line, then re-check throughput on a real request.
-
-## 4b. Changing the model
-
-```sh
-og models                       # what is installed, and which profile is active
-og models use qwen3-coder-30b-fast  # persist the default to ~/.og/config.json
-og engine stop                  # required when the weights file differs
-```
-
-Inside the TUI, `/models list`, `/models info <key>` and `/models switch <key>` do the same for
-one session. A switch to a profile whose weights differ from the loaded ones warns and takes
-effect on the next prompt; the engine reloads then, which costs a cold model load (tens of
-seconds for a 16 GiB file, near-instant once the file is in the OS page cache).
-
-`og models use` writes only the `model` key, and machine config is the *second* layer: a
-`<workspace>/.og/config.json` with its own `model` still wins. If a `use` appears to do
-nothing, check for a workspace override first.
-
-## 4c. Shell completion
+## 4. Shell completion
 
 ```sh
 eval "$(og completion bash)"                    # this session
@@ -261,118 +189,144 @@ og completion powershell | Out-String | Invoke-Expression   # this session
 og completion powershell | Out-File -Append $PROFILE        # permanently
 ```
 
-The scripts embed a static vocabulary and never execute `og`, so completion works even when the
-engine is down. Known PowerShell 5.1 limitation: its parser does not invoke native completers
-while the word being completed is a `-flag`, so flags complete after a positional word but not
-from a bare `-`. Bash has no such gap. Inside the TUI, `Tab` completes slash commands, model
-keys and filesystem paths.
+The scripts embed a static vocabulary and never execute `og`, so completion works with no server
+anywhere in sight. Known PowerShell 5.1 limitation: its parser does not invoke native completers
+while the word being completed is a `-flag`, so flags complete after a positional word but not from
+a bare `-`. Bash has no such gap. Inside the TUI, `Tab` completes slash commands, model keys and
+filesystem paths.
 
 ## 5. Failure modes
 
-### Engine will not start
+All of these are client-side symptoms. Half of them have server-side causes, and each entry says
+which side to fix.
 
-`og` prints the full command line and the last 20 lines of `engine.log`. Work down this list:
+### Endpoint unreachable, versus reachable and unhappy
 
-```sh
-og engine status -v          # prints the argv; copy it
-ls -l ~/.local/llama.cpp/current                 # where does `current` actually point?
-~/.local/llama.cpp/current/llama-server --version
-```
+`og` splits these deliberately, because the fixes have nothing in common.
 
-On Windows (PowerShell):
+| What you see | What happened | Fix |
+| --- | --- | --- |
+| `error no server answering at <endpoint> (Unable to connect. Is the computer able to access the url?)` | a transport failure of some kind — refused, unresolvable host, rejected TLS, or timeout. Bun reports all four with that one sentence | `curl -v <endpoint>/v1/models` to find out which, then start a server (§1) or fix `endpoint` |
+| `error chat completion failed: HTTP 401 Unauthorized — <body>` | the endpoint answered: the key is missing, wrong, or not entitled to this model | see *Missing `apiKeyEnv`* below |
+| `... HTTP 403 Forbidden — <body>` | authenticated but not permitted — wrong org, wrong project, or a model you have no access to | the body says which; fix the key or the model id |
+| `... HTTP 404 Not Found — <body>` | reachable, but `POST {endpoint}/v1/chat/completions` is not there. Usually `endpoint` carries a path it should not, or the server is not OpenAI-compatible | `endpoint` is a **base URL**: `https://api.openai.com`, never `.../v1` and never `.../v1/chat/completions` |
+| `... HTTP 400 Bad Request — <body naming a parameter>` | the endpoint rejected part of the request body | see *Sampling knobs the endpoint rejects* below |
+| `... HTTP 429` or `5xx`, reported after retries | the server is loading, overloaded or rate-limiting. `ProviderError` treats 408, 429, 5xx and transport errors as retryable and gives up only after exhausting them | wait, or reduce concurrency on the server |
 
-```powershell
-Get-Item $env:USERPROFILE\.local\llama.cpp\current | Select-Object LinkType, Target
-& $env:USERPROFILE\.local\llama.cpp\current\llama-server.exe --version
-```
+Everything after ` — ` is the server's own response body, passed through verbatim (truncated at
+2000 characters). That is the part worth reading: on a `400` or `404` it usually names the exact
+parameter or route it disliked, and no amount of client-side guessing improves on it. This is why
+`og` proceeds on any HTTP response rather than second-guessing a non-200.
 
-- `llama-server not found at ...` — `engine.binDir` is wrong, or `current` no longer resolves.
-  On Linux re-run `../og-llama-cpp/install-engine.sh`; it rebuilds the pinned tag from
-  source and re-points the `current` symlink at the result. On Windows re-run
-  `powershell -ExecutionPolicy Bypass -File ..\og-llama-cpp\install-engine.ps1`; it
-  re-downloads the release zips and re-creates the `current` junction. Engine installation is a
-  separate concern from the CLI and lives in its own repository (§6).
-- Linux — `error while loading shared libraries: libcudart.so.13` (or `libcublas`, `libcublasLt`):
-  the CUDA runtime libraries are missing from `engine.binDir`. Re-run the installer: it copies them
-  in next to `llama-server` and links with `RPATH=$ORIGIN`, so the server needs no
-  `LD_LIBRARY_PATH` and no system-wide CUDA.
-- Windows — the process dies at once with `The code execution cannot proceed because
-  cudart64_13.dll was not found` (or `cublas64_13.dll`, or a missing `ggml-cuda.dll`): the cudart
-  zip never landed in `engine.binDir`. Re-run `install-engine.ps1`, which unpacks
-  `cudart-llama-bin-win-cuda-13.3-x64.zip` into the same flat directory as `llama-server.exe`.
-  Windows resolves DLLs beside the executable, so nothing has to go on the system `PATH`.
-- `llama-server exited before becoming healthy` with a CUDA OOM in the log — the profile does
-  not fit *right now*. Go to §4, step 1.
-- `did not report healthy ... within 240s` while the log still shows tensor loading — the model
-  is loading from cold storage. Raise `engine.startupTimeoutSec` or warm the file cache.
-- Run the printed argv by hand in a terminal. That gets you the error on your screen instead of
-  in a log, and it separates "og is broken" from "llama.cpp is unhappy".
+A retryable failure is announced before each attempt as a non-fatal `error` event —
+`... - retrying in 500ms (attempt 2/4)` — with backoff 500 ms, 1.5 s, 4 s. Four attempts total, then
+the run fails. Seeing those banners on a local server usually means it is still loading a model.
 
-### Port 8127 already in use
+A `401` on a *loopback* endpoint means something other than the server you think is on that port.
+Confirm with the port owner:
 
 ```sh
 ss -ltnp 'sport = :8127'
-ps -o pid,lstart,cmd -p <pid>
 ```
-
-On Windows (PowerShell):
 
 ```powershell
 Get-NetTCPConnection -LocalPort 8127 -State Listen | Select-Object OwningProcess
-Get-Process -Id <pid> | Select-Object Id, ProcessName, StartTime, Path
 ```
 
-- If it is a healthy `llama-server` with the model you want, do nothing: `og` adopts it.
-- If it is a `llama-server` with the *wrong* model, `og engine stop` (if `engine.json` exists) or
-  `kill <pid>` / `Stop-Process -Id <pid>`, then start again.
-- If it is something else entirely, move `og`: set `engine.port` in `~/.og/config.json` (and
-  `endpoint` to match — both must agree; `endpoint` is what the provider dials, `engine.port` is
-  what the server binds).
+### The model id the server does not recognise
 
-### Model file missing
+Symptom: the request fails immediately with a server-side message naming the model, such as
+llama.cpp's `model not found` or OpenAI's `The model \`...\` does not exist`.
 
-`og models` and any start attempt fail loudly, listing what is actually on disk:
-
-```
-Model file for profile "qwen3-coder-30b" not found: ~/models/Qwen3-Coder-...gguf
-GGUF files present in ~/models:
-  Devstral-Small-2507-Q4_K_M.gguf
-  ...
-```
-
-Fix `profile.file` (relative to `engine.modelsDir`, or absolute) or `engine.modelsDir`. Run
-`og models` until every profile you care about says `present`.
-
-### Stale `~/.og/engine.lock`
-
-The lock serialises concurrent starts across processes. A crashed starter can leave it behind.
-The rules, so you know when to intervene:
-
-- While the lock is held, other `og` processes poll; if the endpoint becomes healthy they
-  simply proceed.
-- A lock whose **mtime is older than 5 minutes** is considered stale and broken automatically.
-- Only if waiting exceeds `startupTimeoutSec + 5 min` do you get:
-  `Timed out waiting for another og process to start the engine (lock: .../engine.lock).
-  Delete the lock file if no server is starting.`
-
-So: check that nothing is legitimately starting, then delete the lock.
+`og` sends `spec.id ?? <record key>` verbatim and never rewrites it. So:
 
 ```sh
-pgrep -a llama-server
-tail -n 20 ~/.og/engine.log
-rm ~/.og/engine.lock
+og models                                                # what id would be sent, and to where
+curl -sS http://127.0.0.1:8127/v1/models                 # what the server admits to serving
 ```
 
-On Windows (PowerShell):
+- A `llama-server` serves exactly one model, under its `--alias` (which `serve.ts` defaults
+  to the profile key). Either match your entry's `id` to that alias, or restart the server with the
+  alias you want.
+- On a gateway the id is usually namespaced (`anthropic/claude-sonnet-4`,
+  `qwen/qwen3-coder-30b-instruct`). Set `id` on the entry and keep the record key short; the key is
+  only what you type.
+- One config can address several endpoints at once — an entry's own `endpoint` beats the top-level
+  one — so "wrong model" and "right model, wrong endpoint" look identical until you read
+  `og models`.
+
+### Missing `apiKeyEnv` variable
+
+`apiKeyEnv` names an environment variable, not a key. An unset or empty one is a hard `ConfigError`
+before any request goes out, rather than an anonymous request that comes back `401`:
+
+```sh
+og models                       # the entry's line ends with: key from $OPENAI_API_KEY
+printenv OPENAI_API_KEY | wc -c # 0 means unset or empty
+export OPENAI_API_KEY=sk-...
+```
 
 ```powershell
-Get-Process llama-server -ErrorAction SilentlyContinue | Select-Object Id, StartTime, Path
-Get-Content -Tail 20 $env:USERPROFILE\.og\engine.log
-Remove-Item $env:USERPROFILE\.og\engine.lock
+if (-not $env:OPENAI_API_KEY) { "unset" }
+$env:OPENAI_API_KEY = 'sk-...'
 ```
 
-Do **not** delete it while a start is in progress; you will get two servers racing for the same
-port and the same 16 GiB.
+Watch for the two-shell trap: a key exported in one terminal does not exist in another, and a
+`$PROFILE`/`.bashrc` export does not reach an already-open shell. If you would rather not manage a
+variable per provider, `apiKey` / `OG_API_KEY` is the fallback used by any entry that names no
+`apiKeyEnv` — but never put a key in a config file that git can see.
+
+### Context window mismatch
+
+The most silent client-side misconfiguration. `contextWindow` is what the agent budgets and
+compacts against; it is *not* communicated to the server and is not checked against it. Get it
+wrong in either direction and nothing errors:
+
+- **Too high** (config says 32768, server started with `-c 8192`): `og` happily builds a 20k-token
+  prompt and the server truncates or rejects it. Symptom is a model that has visibly forgotten the
+  start of the conversation, or a `400` about context length, with the `ctx` gauge sitting at a
+  comfortable 60%.
+- **Too low**: compaction fires far earlier than it needs to, you see frequent `compaction` events,
+  and the agent keeps dropping turns it could have kept.
+
+Both numbers are directly readable, so this never has to be a guess:
+
+```sh
+og models                                                        # window <n> — what og budgets
+curl -sS http://127.0.0.1:8127/v1/models | jq '.data[].meta.n_ctx'   # what the server allocated
+```
+
+A live example of the mismatch, from a server started for a smoke test with `-c 8192` while the
+config still claimed 32768: `og models` said `window 32768`, `n_ctx` said `8192`. Nothing in either
+process complained.
+
+Fix with `--context-window <n>` for one run, or by correcting `contextWindow` in the entry — and if
+the *server* is the wrong one, `serve.ts --dry-run` shows the `-c` it would use for each
+profile. When a server divides its KV cache across slots (`--parallel N`), the per-client window is
+`n_ctx / N`; size `contextWindow` to that, not to `n_ctx`.
+
+`/usage` and `/context` in the TUI show the same budget from the inside: window, reserve,
+compaction threshold and what is currently occupying the context.
+
+### Tool calls arrive as prose
+
+Symptom: the model narrates tool use in text — XML-ish tags, a JSON blob in the reply, "I will now
+read the file" — and no `tool-start` event ever fires. The run does nothing useful and burns steps.
+
+This is a **server-side chat template** problem, and it is the single most common cause of an
+otherwise-healthy setup producing garbage. Tool calls have to come back as native OpenAI
+`tool_calls`; that only happens if the server applies the model's own chat template.
+
+- For llama.cpp that is `--jinja`. `og-llama-cpp/serve.ts` always passes it — confirm with
+  `bun run serve.ts --dry-run` — so a server showing this symptom was almost certainly
+  started by hand without it.
+- For vLLM it is the equivalent tool-parser flags; for a hosted API it is the vendor's job and
+  already true.
+- `og` cannot compensate. It never scrapes prose for tool calls, by design: a scraper turns a
+  configuration error into intermittent, silent misbehaviour.
+
+Distinguish this from *malformed* tool-call arguments, below: prose means the template is missing,
+bad JSON means the template is working and the model is sloppy.
 
 ### Model produced malformed tool-call arguments
 
@@ -380,20 +334,72 @@ Handled in-loop, not fatal. Non-JSON arguments or a schema violation are returne
 as tool output — `Error: invalid arguments for edit: ... Re-read the tool schema and call it
 again with corrected JSON.` — and it retries. What to do when it happens *repeatedly*:
 
-- Confirm `--jinja` is on the server command line (`og engine status -v`). Without it the
-  model's own chat template is not applied, tool calls arrive as prose, and everything
-  downstream is garbage. This is the single most common cause.
-- Check the profile's sampling. Tool-call JSON degrades at high temperature; the Qwen profiles
-  ship the author-recommended `temp 0.7 / top-p 0.8 / top-k 20 / repeat-penalty 1.05`.
-- Q3 weights are measurably looser at structured output than Q4. If `qwen3-coder-30b-fast` is
-  fumbling arguments, that is the trade you accepted; switch back to `qwen3-coder-30b`.
-- Persistent whole-request failure with a jinja template error in `engine.log` usually means an
-  orphaned `role: "tool"` message reached the server. File it: compaction is supposed to make
-  that impossible (it drops whole turns only).
+- Check the entry's sampling. Tool-call JSON degrades at high temperature; the shipped Qwen entries
+  use `top-p 0.8 / top-k 20 / min-p 0 / repeat-penalty 1.05` with `agent.temperature` at 0.2.
+- Lower-precision weights are measurably looser at structured output. If the fast Q3 operating
+  point is fumbling arguments, that is the trade you accepted; serve the Q4 one instead.
+- Persistent whole-request failure with a jinja template error in the *server's* log usually means
+  an orphaned `role: "tool"` message reached it. File it against `og`: compaction is supposed to
+  make that impossible, because it drops whole turns only.
+
+### Sampling knobs the endpoint rejects
+
+`topK`, `minP` and `repeatPenalty` are llama.cpp/vLLM extensions, sent as `top_k`, `min_p` and
+`repeat_penalty`. OpenAI proper and strict gateways reject unknown arguments outright, so an entry
+carrying them fails **every** request with a `400` naming the parameter.
+
+Each sampling field is sent only when set, so the fix is to delete the offending fields from that
+entry rather than to zero them. Keep the llama.cpp knobs on local entries and leave hosted entries
+to `temperature` and `topP`.
+
+To reproduce that class of failure without a hosted account, `test/fixtures/strict-openai-server.ts`
+is a throwaway endpoint that rejects exactly what OpenAI rejects — unknown request fields, a missing
+bearer token, a model id it does not serve:
+
+```sh
+bun run test/fixtures/strict-openai-server.ts 8199          # prints the token it expects
+OG_API_KEY=test-token og --endpoint http://127.0.0.1:8199 -m strict-gpt -p "hello"
+```
+
+It logs the exact field set each request carried, which is the fastest way to prove what `og` is
+sending before blaming the gateway.
+
+### Generation is slow
+
+Not a client-side problem, and not something `og` can diagnose: it cannot see the GPU, and against
+a remote endpoint it is not even on the right machine.
+
+What `og` *can* tell you is which phase is slow, which is enough to route the ticket:
+
+```
+/usage     last run  2 steps · 1.5s wall · decode 82.1 tok/s · ttft 1.2s
+```
+
+- **Low `tok/s` with a normal `ttft`** — decode is slow. Server or GPU.
+- **High `ttft` that grows with the transcript** — prefill dominates. Expected; `ttft` includes
+  prefilling the whole transcript, so it grows with context. A shorter session or more aggressive
+  compaction helps.
+- **Both collapsed together** on a local llama.cpp server — on a 16 GiB card this is very likely
+  the driver spilling weights to host RAM once resident VRAM passes ~15.4 GiB. It never errors and
+  never logs; throughput just drops about 8x. The measurement, the cliff and the fix ladder are in
+  [`../../og-llama-cpp/docs/benchmarks.md`](../../og-llama-cpp/docs/benchmarks.md) §5, and the
+  offload split that avoids it is a `serve.ts` profile, not an `og` setting.
+
+Server-side reading, on the box that runs the server: `nvidia-smi` for who else is on the GPU, and
+llama.cpp's own per-request timings, which appear directly in the terminal running
+`serve.ts` (it inherits stdio):
+
+```
+slot print_timing: id  0 | task 2744 | prompt eval time = 72.25 ms / 11 tokens (6.57 ms per token, 152.24 tokens per second)
+slot print_timing: id  0 | task 2744 |        eval time = 20.43 ms /  2 tokens (20.43 ms per token,  48.95 tokens per second)
+```
+
+Prompt eval is prefill, eval is generation. Very short requests look slow per-token because of
+fixed overhead; judge throughput only on requests of a few hundred tokens or more.
 
 ### Context exhaustion and compaction
 
-The agent budgets against `profile.contextWindow`, holds back `agent.contextReservePct` (0.25)
+The agent budgets against the entry's `contextWindow`, holds back `agent.contextReservePct` (0.25)
 for the next response plus tool results, and compacts once usage passes
 `agent.compactThresholdPct` (0.75). Compaction drops the **oldest whole turns** — a user
 message plus every assistant/tool message following it — never a partial turn, and never the
@@ -403,13 +409,14 @@ runs emit a `compaction` event with `removedMessages` and `freedTokens`.
 Signs you need more room: frequent `compaction` events, or `/context` in the TUI showing tool
 results dominating the window.
 
-- Use `qwen3-coder-30b-long` (65536) instead of raising `contextWindow` past `ctx` — the window
-  must be `<= ctx`, and `ctx` is what determines the KV cache size on the GPU.
+- Use an entry with a larger window against a server actually started with that much `-c`
+  (`qwen3-coder-30b-long` is 65536) rather than raising `contextWindow` past what the server
+  serves — see *Context window mismatch* above.
 - Lower `tools.maxOutputBytes` (default 65536) if giant `bash`/`grep` results are eating the
   window.
 - Split the task. A single turn whose *own* content exceeds the window cannot be compacted away
-  (the last turn is never dropped); it is returned as-is with an honest `removed` count and the
-  server will truncate. That shows up as a suspiciously confused model, not an error.
+  (the last turn is never dropped); it is sent as-is with an honest `removed` count and the server
+  will truncate. That shows up as a suspiciously confused model, not an error.
 
 ### Approval denials in headless mode
 
@@ -434,35 +441,33 @@ usually ends with the model explaining it could not proceed. Fixes, in order of 
   the gate.
 - Run interactively for one-offs: the TUI prompts, and `/help` lists everything else available.
 
-## 6. Engine installs and upgrades
+## 6. Serving, installs and upgrades
 
-Not this project's concern. `og` supervises whatever OpenAI-compatible server
-`cfg.endpoint` names; getting a pinned llama.cpp CUDA `llama-server` onto the box, bumping its
-build, rolling one back and building it by hand all live in the sibling `../og-llama-cpp`
-directory:
+Not this project's concern, and not reachable from this project's code. `og` talks HTTP to
+`endpoint` and stops there; getting a pinned llama.cpp CUDA `llama-server` onto the box, running
+it, bumping its build, rolling one back and building it by hand all live in the sibling
+`../og-llama-cpp` directory:
 
 | Task | Where |
 | --- | --- |
 | Install the pinned build (Linux and Windows) | `../../og-llama-cpp/README.md` |
+| Run a server (`serve.ts`), inspect its argv, pick an operating point | `../../og-llama-cpp/README.md` |
 | Bump the build, revalidate, roll back | `../../og-llama-cpp/docs/upgrading.md` |
 | Build llama.cpp by hand | `../../og-llama-cpp/docs/building-by-hand.md` |
-| VRAM and throughput per profile, measured | `../../og-llama-cpp/docs/benchmarks.md` |
+| VRAM and throughput per operating point, measured; the spill cliff and its fix ladder | `../../og-llama-cpp/docs/benchmarks.md` |
+| `llama-server` flag names for the pinned build | `../../og-llama-cpp/serve.ts` — the only place in the repository that builds that argv |
 
-Two things stay this project's problem after an engine upgrade:
+One thing stays this project's problem after a server-side change: **`contextWindow`**. It is the
+only server-side number `og` carries, it is copied from the measurement record, and nothing
+validates it against the running server (§5, *Context window mismatch*). If an upgrade or a
+re-measurement moves an operating point's `-c`, update the entry in `src/config/load.ts` to match.
 
-- **Re-check VRAM for every profile you use** — `og engine status`. Kernel and allocator changes
-  move the spill threshold by hundreds of MiB, and the failure is silent (§4).
-- **Re-check the flag names.** Only `src/engine/args.ts` builds the argv, and its flags were
-  verified against b10488's `llama-server --help`: `-ngl`, `--n-cpu-moe`, `-c`,
-  `--cache-type-k/v`, `--flash-attn on|off`, `--jinja`, `-t`, `-b`, `-ub`, `--parallel`,
-  `--no-webui`, `--metrics`, `--cont-batching`, and the sampling flags. A renamed or removed flag
-  shows up as an immediate startup failure with the argv in the message, which is the good kind
-  of failure.
-
-The smoke test after any engine change is three commands:
+The client-side smoke test after any server change is two commands, run with the server up:
 
 ```sh
-og engine stop && og engine start && og engine status
 og -p "reply with the single word ready" --max-steps 1
 og --json -p "list the files in src/ and count them"   # exercises tools end to end
 ```
+
+The first proves the endpoint, the key and the model id. The second proves the chat template: if
+tool calls come back as prose instead of `tool-start` events, see §5.

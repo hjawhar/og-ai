@@ -1,14 +1,14 @@
 /**
  * Layered configuration resolution:
  *   DEFAULT_CONFIG -> ~/.og/config.json -> <workspace>/.og/config.json -> OG_* env -> overrides
- * Objects merge recursively (so `profiles` merges per key, and a user may override a
- * single field of a single profile); arrays replace wholesale.
+ * Objects merge recursively (so `models` merges per key, and a user may override a
+ * single field of a single model); arrays replace wholesale.
  */
 
 import { readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { OgConfig, ModelProfile } from "./schema.ts";
+import type { ModelSpec, OgConfig } from "./schema.ts";
 import { ConfigError } from "./schema.ts";
 
 const HOME = os.homedir();
@@ -51,9 +51,8 @@ const BASH_DENY_PATTERNS: string[] = [
 	"\\bgit\\s+push\\s+[^\\n]*(--force(?!-with-lease)|\\s-f\\b)[^\\n]*\\b(main|master)\\b",
 ];
 
-/** Qwen3-Coder author-recommended sampling. */
+/** Qwen3-Coder author-recommended sampling, minus temperature (see below). */
 const QWEN_SAMPLING = {
-	temperature: 0.7,
 	topP: 0.8,
 	topK: 20,
 	minP: 0,
@@ -61,85 +60,36 @@ const QWEN_SAMPLING = {
 } as const;
 
 /**
- * Profile values are measured, not guessed, on an RTX 5070 Ti (16302 MiB) with
- * llama.cpp b10488 / CUDA 13.3. The binding constraint is VRAM: once resident
- * memory passes ~15.4 GiB the driver silently spills to host RAM and throughput
- * collapses by ~8x (measured: 15750 MiB -> 120 tok/s prefill, 29 tok/s gen).
- * Every profile below is sized to leave >= 1.2 GiB of headroom for the desktop.
+ * Context window for a model og was not told about — `og -m <name>` against an
+ * arbitrary endpoint. Deliberately conservative: budgeting against a window
+ * larger than the server's makes the server truncate silently, while budgeting
+ * low only costs an earlier compaction. Override with `--context-window`.
+ */
+export const DEFAULT_CONTEXT_WINDOW = 32768;
+
+/**
+ * The shipped entries are the operating points measured in
+ * og-llama-cpp/docs/benchmarks.md; `contextWindow` is the only number og needs,
+ * because the offload split that makes it fit belongs to whoever starts the
+ * server (og-llama-cpp/serve.ts).
  *
- * Measured (6k-token prefill, 256-token generation, q8_0 KV, flash attention):
- *   qwen3-coder-30b       14714 MiB   1476 tok/s prefill    82 tok/s gen
- *   qwen3-coder-30b-long  15082 MiB   1238 tok/s prefill    70 tok/s gen
- *   qwen3-coder-30b-fast  14569 MiB   2957 tok/s prefill   137 tok/s gen
+ * None of them sets `temperature`: `agent.temperature` (0.2) governs, which is
+ * what was actually in force before — tool-call JSON degrades at the 0.7 Qwen
+ * recommends for chat.
  */
 export const DEFAULT_CONFIG: OgConfig = {
 	endpoint: "http://127.0.0.1:8127",
 	model: "qwen3-coder-30b",
 	stateDir: path.join(HOME, ".og"),
-	profiles: {
-		// Default: best quality/context balance that still fits with headroom.
-		"qwen3-coder-30b": {
-			file: "Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL.gguf",
-			ctx: 32768,
-			nGpuLayers: 99,
-			nCpuMoe: 14,
-			cacheTypeK: "q8_0",
-			cacheTypeV: "q8_0",
-			flashAttn: true,
-			contextWindow: 32768,
-			...QWEN_SAMPLING,
-		},
-		// Same weights, 64k context; pays ~15% throughput for 2x context.
-		"qwen3-coder-30b-long": {
-			file: "Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL.gguf",
-			ctx: 65536,
-			nGpuLayers: 99,
-			nCpuMoe: 18,
-			cacheTypeK: "q8_0",
-			cacheTypeV: "q8_0",
-			flashAttn: true,
-			contextWindow: 65536,
-			...QWEN_SAMPLING,
-		},
-		// Lower-precision weights, far more experts resident on GPU: ~1.7x faster.
-		"qwen3-coder-30b-fast": {
-			file: "Qwen3-Coder-30B-A3B-Instruct-UD-Q3_K_XL.gguf",
-			ctx: 32768,
-			nGpuLayers: 99,
-			nCpuMoe: 4,
-			cacheTypeK: "q8_0",
-			cacheTypeV: "q8_0",
-			flashAttn: true,
-			contextWindow: 32768,
-			...QWEN_SAMPLING,
-		},
-		// 24B dense at Q4 leaves room for only 8k of KV cache on 16 GiB.
-		// Measured: c8192 ngl99 -> 15045 MiB, 2292 tok/s prefill, 51 tok/s gen.
-		// Partial offload to reach 32k costs 3.6x generation speed (14 tok/s),
-		// so full offload with a short window is the only sane operating point.
-		"devstral-24b": {
-			file: "Devstral-Small-2507-Q4_K_M.gguf",
-			ctx: 8192,
-			nGpuLayers: 99,
-			cacheTypeK: "q8_0",
-			cacheTypeV: "q8_0",
-			flashAttn: true,
-			contextWindow: 8192,
-			temperature: 0.15,
-			topP: 0.95,
-		},
-	},
-	engine: {
-		autoStart: true,
-		binDir: path.join(HOME, ".local", "llama.cpp", "current"),
-		modelsDir: path.join(HOME, "models"),
-		host: "127.0.0.1",
-		port: 8127,
-		threads: Math.max(4, Math.floor(os.cpus().length / 2)),
-		batchSize: 2048,
-		ubatchSize: 512,
-		slots: 1,
-		startupTimeoutSec: 240,
+	models: {
+		// Best quality/context balance measured on a 16 GiB card: 82.1 tok/s.
+		"qwen3-coder-30b": { contextWindow: 32768, ...QWEN_SAMPLING },
+		// Same weights, 64k window; pays ~15% throughput for 2x context.
+		"qwen3-coder-30b-long": { contextWindow: 65536, ...QWEN_SAMPLING },
+		// Q3 weights, ~1.7x faster (136.5 tok/s), measurably looser at structured output.
+		"qwen3-coder-30b-fast": { contextWindow: 32768, ...QWEN_SAMPLING },
+		// 24B dense: full offload leaves room for only 8k of q8_0 KV cache.
+		"devstral-24b": { contextWindow: 8192, topP: 0.95 },
 	},
 	agent: {
 		maxSteps: 60,
@@ -224,10 +174,6 @@ function envLayer(): Record<string, unknown> {
 	if (apiKey) layer["apiKey"] = apiKey;
 	const stateDir = process.env["OG_STATE_DIR"];
 	if (stateDir) layer["stateDir"] = stateDir;
-	const noAutostart = process.env["OG_NO_AUTOSTART"]?.trim().toLowerCase();
-	if (noAutostart !== undefined && noAutostart !== "" && !["0", "false", "no", "off"].includes(noAutostart)) {
-		layer["engine"] = { autoStart: false };
-	}
 	return layer;
 }
 
@@ -245,43 +191,73 @@ function requireObject(value: unknown, field: string): Record<string, unknown> {
 	return value;
 }
 
+function optionalString(value: unknown, field: string): string | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value !== "string" || value.length === 0) {
+		throw new ConfigError(`invalid config: \`${field}\` must be a non-empty string, got ${JSON.stringify(value)}`);
+	}
+	return value;
+}
+
+function optionalNumber(value: unknown, field: string): void {
+	if (value === undefined) return;
+	if (typeof value !== "number" || !Number.isFinite(value)) {
+		throw new ConfigError(`invalid config: \`${field}\` must be a finite number, got ${JSON.stringify(value)}`);
+	}
+}
+
+function requireUrl(value: string, field: string): void {
+	try {
+		new URL(value);
+	} catch {
+		throw new ConfigError(`invalid config: \`${field}\` is not a valid URL: ${value}`);
+	}
+}
+
 /** Shape-checks the merged layers and hands back a trusted OgConfig. */
 function validate(raw: Record<string, unknown>): OgConfig {
 	const endpoint = raw["endpoint"];
 	if (typeof endpoint !== "string" || endpoint.length === 0) {
 		throw new ConfigError("invalid config: `endpoint` must be a non-empty URL string");
 	}
-	try {
-		new URL(endpoint);
-	} catch {
-		throw new ConfigError(`invalid config: \`endpoint\` is not a valid URL: ${endpoint}`);
-	}
+	requireUrl(endpoint, "endpoint");
+	optionalString(raw["apiKey"], "apiKey");
 	if (typeof raw["stateDir"] !== "string" || raw["stateDir"].length === 0) {
 		throw new ConfigError("invalid config: `stateDir` must be a non-empty path");
 	}
 
-	const profiles = requireObject(raw["profiles"], "profiles");
-	if (Object.keys(profiles).length === 0) {
-		throw new ConfigError("invalid config: `profiles` must contain at least one model profile");
-	}
-	for (const [key, value] of Object.entries(profiles)) {
-		const profile = requireObject(value, `profiles.${key}`);
-		if (typeof profile["file"] !== "string" || profile["file"].length === 0) {
-			throw new ConfigError(`invalid config: \`profiles.${key}.file\` must be a GGUF filename or absolute path`);
-		}
-		const ctx = requirePositiveNumber(profile["ctx"], `profiles.${key}.ctx`);
-		const window = requirePositiveNumber(profile["contextWindow"], `profiles.${key}.contextWindow`);
-		if (window > ctx) {
-			throw new ConfigError(
-				`invalid config: \`profiles.${key}.contextWindow\` (${window}) must be <= \`profiles.${key}.ctx\` (${ctx})`,
-			);
+	// No emptiness check: layers merge rather than replace, so the shipped models
+	// always survive a user's `models` block and the record cannot be empty.
+	const models = requireObject(raw["models"], "models");
+	for (const [key, value] of Object.entries(models)) {
+		const spec = requireObject(value, `models.${key}`);
+		requirePositiveNumber(spec["contextWindow"], `models.${key}.contextWindow`);
+		optionalString(spec["id"], `models.${key}.id`);
+		optionalString(spec["apiKeyEnv"], `models.${key}.apiKeyEnv`);
+		const modelEndpoint = optionalString(spec["endpoint"], `models.${key}.endpoint`);
+		if (modelEndpoint !== undefined) requireUrl(modelEndpoint, `models.${key}.endpoint`);
+		optionalNumber(spec["maxTokens"], `models.${key}.maxTokens`);
+		optionalNumber(spec["temperature"], `models.${key}.temperature`);
+		optionalNumber(spec["topP"], `models.${key}.topP`);
+		optionalNumber(spec["topK"], `models.${key}.topK`);
+		optionalNumber(spec["minP"], `models.${key}.minP`);
+		optionalNumber(spec["repeatPenalty"], `models.${key}.repeatPenalty`);
+		if (spec["headers"] !== undefined) {
+			const headers = requireObject(spec["headers"], `models.${key}.headers`);
+			for (const [name, headerValue] of Object.entries(headers)) {
+				if (typeof headerValue !== "string") {
+					throw new ConfigError(
+						`invalid config: \`models.${key}.headers.${name}\` must be a string, got ${JSON.stringify(headerValue)}`,
+					);
+				}
+			}
 		}
 	}
 
 	const model = raw["model"];
-	if (typeof model !== "string" || !Object.hasOwn(profiles, model)) {
+	if (typeof model !== "string" || !Object.hasOwn(models, model)) {
 		throw new ConfigError(
-			`invalid config: \`model\` ${JSON.stringify(model)} is not a known profile; available: ${Object.keys(profiles).join(", ")}`,
+			`invalid config: \`model\` ${JSON.stringify(model)} is not a known model; available: ${Object.keys(models).join(", ")}`,
 		);
 	}
 
@@ -298,7 +274,6 @@ function validate(raw: Record<string, unknown>): OgConfig {
 			`invalid config: \`agent.maxParallelTools\` must be an integer >= 1, got ${JSON.stringify(parallel)}`,
 		);
 	}
-	requireObject(raw["engine"], "engine");
 	const tools = requireObject(raw["tools"], "tools");
 	requireObject(tools["bash"], "tools.bash");
 	requireObject(tools["edit"], "tools.edit");
@@ -310,7 +285,12 @@ function validate(raw: Record<string, unknown>): OgConfig {
 	return raw as unknown as OgConfig;
 }
 
-export function loadConfig(opts: { workspaceRoot: string; overrides?: Partial<OgConfig> }): OgConfig {
+export function loadConfig(opts: {
+	workspaceRoot: string;
+	overrides?: Partial<OgConfig>;
+	/** Context window for the active model; the only knob a pass-through name needs. */
+	contextWindow?: number;
+}): OgConfig {
 	// Cloned so DEFAULT_CONFIG stays pristine; the merge walker works on plain records.
 	const merged = structuredClone(DEFAULT_CONFIG) as unknown as Record<string, unknown>;
 	// Overrides are typed but structurally a record from the walker's point of view.
@@ -324,17 +304,47 @@ export function loadConfig(opts: { workspaceRoot: string; overrides?: Partial<Og
 	for (const layer of layers) {
 		if (layer) mergeInto(merged, layer);
 	}
+
+	// A model name og has never heard of is not an error when the operator named
+	// it explicitly (`-m gpt-4o`, OG_MODEL): any OpenAI-compatible server names
+	// its own models, and demanding a config entry first would make `-m` useless
+	// against every endpoint but the configured one. A name coming from a config
+	// file is still validated, so a typo there is caught instead of silently
+	// dialling a model the server does not have.
+	const models = isPlainObject(merged["models"]) ? merged["models"] : undefined;
+	const active = merged["model"];
+	const explicit = typeof overrides?.["model"] === "string" ? overrides["model"] : process.env["OG_MODEL"];
+	if (models !== undefined && typeof active === "string" && active.length > 0) {
+		if (!Object.hasOwn(models, active) && active === explicit) {
+			models[active] = { id: active, contextWindow: opts.contextWindow ?? DEFAULT_CONTEXT_WINDOW };
+		} else if (opts.contextWindow !== undefined) {
+			const spec = models[active];
+			if (isPlainObject(spec)) spec["contextWindow"] = opts.contextWindow;
+		}
+	}
+
 	return validate(merged);
 }
 
-/** Resolves a profile by key, defaulting to the active `cfg.model`. */
-export function profileOf(cfg: OgConfig, key?: string): ModelProfile {
+/** Resolves a model spec by key, defaulting to the active `cfg.model`. */
+export function modelSpecOf(cfg: OgConfig, key?: string): ModelSpec {
 	const wanted = key ?? cfg.model;
-	const profile = cfg.profiles[wanted];
-	if (!profile) {
+	const spec = cfg.models[wanted];
+	if (!spec) {
 		throw new ConfigError(
-			`unknown model profile "${wanted}"; available: ${Object.keys(cfg.profiles).join(", ") || "(none)"}`,
+			`unknown model "${wanted}"; available: ${Object.keys(cfg.models).join(", ") || "(none)"}`,
 		);
 	}
-	return profile;
+	return spec;
+}
+
+/** Wire model name sent to the endpoint: an explicit `id`, else the record key. */
+export function wireModelOf(cfg: OgConfig, key?: string): string {
+	const wanted = key ?? cfg.model;
+	return modelSpecOf(cfg, wanted).id ?? wanted;
+}
+
+/** Endpoint this model is served from: its own override, else the global one. */
+export function endpointOf(cfg: OgConfig, key?: string): string {
+	return modelSpecOf(cfg, key).endpoint ?? cfg.endpoint;
 }

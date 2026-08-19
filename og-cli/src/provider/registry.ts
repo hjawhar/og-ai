@@ -1,45 +1,37 @@
 /**
- * Resolves the configured profile into a concrete Provider instance.
+ * Resolves the active model spec into a concrete Provider instance.
  */
 
-import { profileOf } from "../config/load.ts";
-import type { OgConfig } from "../config/schema.ts";
+import { modelSpecOf } from "../config/load.ts";
+import { ConfigError, type OgConfig } from "../config/schema.ts";
 import { OpenAIProvider } from "./openai.ts";
 import type { Provider } from "./types.ts";
 
-const LOOPBACK_HOSTS: Record<string, true> = {
-	localhost: true,
-	"127.0.0.1": true,
-	"0.0.0.0": true,
-	"::1": true,
-	"[::1]": true,
-	"::": true,
-};
-
-/**
- * True when the endpoint is a llama.cpp-shaped local server, in which case the
- * model name is ignored by the backend and "local" is the honest identifier.
- */
-function isLocalEndpoint(endpoint: string): boolean {
-	const forced = process.env["OG_LOCAL_ENDPOINT"]?.trim().toLowerCase();
-	if (forced !== undefined && forced !== "" && !["0", "false", "no", "off"].includes(forced)) return true;
-	try {
-		const host = new URL(endpoint).hostname.toLowerCase();
-		return LOOPBACK_HOSTS[host] === true || host.endsWith(".localhost");
-	} catch {
-		return false;
-	}
-}
-
 export function createProvider(cfg: OgConfig): Provider {
 	const key = cfg.model;
-	const profile = profileOf(cfg, key);
+	const spec = modelSpecOf(cfg, key);
+
+	// A named env var is an explicit statement that this model needs a key, so an
+	// unset one is a configuration error, not a reason to send an anonymous request
+	// and read a 401 back from the server.
+	let apiKey = cfg.apiKey;
+	if (spec.apiKeyEnv !== undefined) {
+		const fromEnv = process.env[spec.apiKeyEnv];
+		if (fromEnv === undefined || fromEnv === "") {
+			throw new ConfigError(
+				`model "${key}" sets apiKeyEnv "${spec.apiKeyEnv}" but that environment variable is empty or unset`,
+			);
+		}
+		apiKey = fromEnv;
+	}
+
 	return new OpenAIProvider({
 		id: key,
-		endpoint: cfg.endpoint,
-		model: isLocalEndpoint(cfg.endpoint) ? "local" : key,
-		contextWindow: profile.contextWindow,
+		endpoint: spec.endpoint ?? cfg.endpoint,
+		model: spec.id ?? key,
+		contextWindow: spec.contextWindow,
 		nativeToolCalls: true,
-		...(cfg.apiKey ? { apiKey: cfg.apiKey } : {}),
+		...(apiKey ? { apiKey } : {}),
+		...(spec.headers ? { headers: spec.headers } : {}),
 	});
 }

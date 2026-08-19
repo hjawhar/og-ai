@@ -2,29 +2,23 @@
  * `/stats` has two hard contracts: collection never fails on a machine that is
  * missing a probe, and rendering never emits a line wider than the terminal
  * (the caller pins these lines, so an overflow corrupts the whole frame).
+ *
+ * A third one is new and just as load-bearing: /stats describes this machine and
+ * this client's configuration. The inference server is another process on the
+ * far side of HTTP, so nothing here may claim to know its build, its weights or
+ * its VRAM — reporting a number og cannot observe is worse than omitting it.
  */
 
-import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
 import { DEFAULT_CONFIG } from "../src/config/load.ts";
 import type { OgConfig } from "../src/config/schema.ts";
 import { setColor, visibleWidth } from "../src/ui/render.ts";
-import { collectSystemInfo, renderSystemInfo, type GpuInfo, type SystemInfo } from "../src/ui/sysinfo.ts";
+import { collectSystemInfo, renderSystemInfo, type SystemInfo } from "../src/ui/sysinfo.ts";
 
 const WIDTHS = [20, 40, 80, 120, 200] as const;
 const MIB = 1024 * 1024;
 const GIB = 1024 * 1024 * 1024;
-
-const tempDirs: string[] = [];
-
-function tempDir(): string {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "og-sysinfo-"));
-	tempDirs.push(dir);
-	return dir;
-}
 
 beforeEach(() => {
 	setColor(false);
@@ -33,20 +27,6 @@ beforeEach(() => {
 afterEach(() => {
 	setColor(false);
 });
-
-afterAll(() => {
-	for (const dir of tempDirs) fs.rmSync(dir, { recursive: true, force: true });
-});
-
-const GPU: GpuInfo = {
-	name: "NVIDIA GeForce RTX 5070 Ti",
-	memoryTotalMiB: 16303,
-	memoryUsedMiB: 6512,
-	driverVersion: "610.88",
-	computeCap: "12.0",
-	utilizationPct: 37,
-	temperatureC: 44,
-};
 
 /** Fully-populated fixture; each test replaces only the branch it exercises. */
 function makeInfo(patch: Partial<SystemInfo> = {}): SystemInfo {
@@ -59,17 +39,8 @@ function makeInfo(patch: Partial<SystemInfo> = {}): SystemInfo {
 			speedMHz: 4700,
 		},
 		memory: { totalBytes: 64 * GIB, freeBytes: 24 * GIB },
-		gpus: [GPU],
 		runtime: { bun: "1.3.14", nodeApi: "24.3.0" },
-		engine: {
-			binDir: "C:\\Users\\someone\\.local\\llama.cpp\\current",
-			resolvedBuild: "b10488",
-			serverVersion: "version: 0.1.2-dev (build 10488, commit 9d77fa172)",
-			endpoint: "http://127.0.0.1:8127",
-			running: true,
-			modelsDir: "C:\\Users\\someone\\models",
-			weights: [{ file: "Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL.gguf", bytes: 17_716_740_096 }],
-		},
+		endpoint: { url: "http://127.0.0.1:8127", model: "qwen3-coder-30b", contextWindow: 32768 },
 		uptimeSec: 11_530,
 		...patch,
 	};
@@ -82,14 +53,11 @@ describe("renderSystemInfo width guarantee", () => {
 				setColor(colour);
 				// Values chosen to be longer than the narrow widths on purpose.
 				const info = makeInfo({
-					gpus: [GPU, { ...GPU, name: "NVIDIA GeForce RTX 4090 Laptop GPU", memoryUsedMiB: 15_998 }],
-					engine: {
-						...makeInfo().engine,
-						binDir: `C:\\${"deep\\".repeat(30)}llama.cpp\\current`,
-						weights: [
-							{ file: "Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL.gguf", bytes: 17_716_740_096 },
-							{ file: `${"x".repeat(300)}.gguf`, bytes: 512 * MIB },
-						],
+					cpu: { model: `Vendor ${"Very".repeat(40)} CPU`, logicalCores: 256, speedMHz: 4700 },
+					endpoint: {
+						url: `https://gateway.example.com/${"deep/".repeat(60)}v1`,
+						model: `org/${"x".repeat(300)}-instruct`,
+						contextWindow: 1_048_576,
 					},
 				});
 				const lines = renderSystemInfo(info, width);
@@ -119,55 +87,64 @@ describe("renderSystemInfo content", () => {
 		const lines = renderSystemInfo(makeInfo(), 200);
 		const text = lines.join("\n");
 		// Colour is off here, so a heading is its own bare line.
-		for (const heading of ["host", "cpu", "memory", "gpu", "runtime", "engine"]) {
+		for (const heading of ["host", "cpu", "memory", "runtime", "endpoint"]) {
 			expect(lines).toContain(heading);
 		}
-		expect(text).toContain("b10488");
-		expect(text).toContain("version: 0.1.2-dev (build 10488, commit 9d77fa172)");
-		expect(text).toContain("http://127.0.0.1:8127");
-		expect(text).toContain("reachable");
+		expect(text).toContain("win32 10.0.26200 (x64)");
+		expect(text).toContain("workstation");
 		expect(text).toContain("8 physical");
 		expect(text).toContain("16 logical");
-		expect(text).toContain("Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL.gguf");
-		expect(text).toContain("16.5 GiB");
+		expect(text).toContain("4700 MHz");
+		expect(text).toContain("1.3.14");
+		expect(text).toContain("24.3.0");
 	});
 
-	test("says so when there is no NVIDIA GPU, rather than rendering an empty section", () => {
-		const lines = renderSystemInfo(makeInfo({ gpus: [] }), 80);
-		const text = lines.join("\n");
-		expect(text).toContain("no NVIDIA GPU detected");
-		expect(text).not.toContain("vram");
-		for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(80);
-	});
-
-	test("renders full and empty VRAM without lying about either", () => {
-		const full = renderSystemInfo(
-			makeInfo({ gpus: [{ ...GPU, memoryUsedMiB: 16_303, memoryTotalMiB: 16_303 }] }),
-			100,
-		).join("\n");
-		expect(full).toContain("100% 16303 / 16303 MiB");
-
-		const empty = renderSystemInfo(
-			makeInfo({ gpus: [{ ...GPU, memoryUsedMiB: 0, memoryTotalMiB: 16_303 }] }),
-			100,
-		).join("\n");
-		expect(empty).toContain("0% 0 / 16303 MiB");
-		expect(empty).not.toContain("100%");
-	});
-
-	test("survives a GPU that reports a zero or nonsense VRAM total", () => {
+	test("reports where requests go, under what name, and with what budget", () => {
 		const text = renderSystemInfo(
 			makeInfo({
-				gpus: [
-					{ ...GPU, memoryUsedMiB: 0, memoryTotalMiB: 0 },
-					{ ...GPU, memoryUsedMiB: Number.NaN, memoryTotalMiB: Number.NaN },
-				],
+				endpoint: {
+					url: "https://openrouter.ai/api/v1",
+					model: "qwen/qwen3-coder-30b-a3b-instruct",
+					contextWindow: 65536,
+				},
 			}),
-			100,
+			200,
 		).join("\n");
-		expect(text).toContain("0% 0 / 0 MiB");
-		expect(text).not.toContain("NaN");
-		expect(text).not.toContain("Infinity");
+
+		expect(text).toContain("https://openrouter.ai/api/v1");
+		// The wire name, not the config key: that is what the server was asked for.
+		expect(text).toContain("qwen/qwen3-coder-30b-a3b-instruct");
+		expect(text).toContain("65536 tok");
+	});
+
+	test("claims nothing about the server it cannot observe", () => {
+		// og no longer starts, inspects or measures an inference server, so every
+		// figure that used to come from one is gone rather than stale.
+		const text = renderSystemInfo(makeInfo(), 200).join("\n").toLowerCase();
+		for (const forbidden of [
+			"gpu",
+			"vram",
+			"nvidia",
+			"gguf",
+			"weights",
+			"bin dir",
+			"models dir",
+			"reachable",
+			"unreachable",
+			"llama",
+			"build",
+		]) {
+			expect(text, forbidden).not.toContain(forbidden);
+		}
+		// And the shape itself carries no room for them.
+		expect(Object.keys(makeInfo()).sort()).toEqual([
+			"cpu",
+			"endpoint",
+			"memory",
+			"os",
+			"runtime",
+			"uptimeSec",
+		]);
 	});
 
 	test("omits absent optional fields instead of leaking undefined", () => {
@@ -175,23 +152,8 @@ describe("renderSystemInfo content", () => {
 			os: { platform: "linux", release: "", arch: "", hostname: "" },
 			cpu: { model: "", logicalCores: 1, speedMHz: 0 },
 			memory: { totalBytes: 0, freeBytes: 0 },
-			gpus: [
-				{
-					name: "Tesla T4",
-					memoryTotalMiB: 15_360,
-					memoryUsedMiB: 1_024,
-					driverVersion: "",
-					computeCap: "",
-				},
-			],
 			runtime: { bun: "1.3.14", nodeApi: "24.3.0" },
-			engine: {
-				binDir: "/opt/llama.cpp",
-				endpoint: "http://10.0.0.4:8127",
-				running: false,
-				modelsDir: "/srv/models",
-				weights: [],
-			},
+			endpoint: { url: "http://10.0.0.4:8127", model: "devstral-24b", contextWindow: 8192 },
 			uptimeSec: 0,
 		};
 		const lines = renderSystemInfo(bare, 80);
@@ -201,17 +163,17 @@ describe("renderSystemInfo content", () => {
 		// Missing physical core count degrades to the logical count alone.
 		expect(text).toContain("1 logical");
 		expect(text).not.toContain("physical");
-		// No driver/compute/util/temp reported: those rows disappear entirely.
-		expect(text).not.toContain("driver");
-		expect(text).not.toContain("util");
-		expect(text).not.toContain("build");
-		expect(text).not.toContain("server");
-		expect(text).toContain("unreachable");
-		expect(text).toContain("none found");
+		// An unreported clock is a missing probe, so that row disappears entirely.
+		expect(text).not.toContain("MHz");
+		expect(text).not.toContain("hostname");
+		expect(text).toContain("unknown");
+		// The endpoint block never degrades: it is configuration, always present.
+		expect(text).toContain("http://10.0.0.4:8127");
+		expect(text).toContain("8192 tok");
 		for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(80);
 	});
 
-	test("formats sizes at the unit boundaries", () => {
+	test("formats memory at the unit boundaries", () => {
 		const sizes: [number, string][] = [
 			[0, "0 B"],
 			[1023, "1023 B"],
@@ -224,45 +186,52 @@ describe("renderSystemInfo content", () => {
 			[17_716_740_096, "16.5 GiB"],
 			[-1, "?"],
 		];
-		for (const [bytes, expected] of sizes) {
-			// The size is the aligned label of the weights row, so padding is collapsed.
-			const text = renderSystemInfo(
-				makeInfo({
-					engine: { ...makeInfo().engine, weights: [{ file: "w.gguf", bytes }] },
-				}),
-				100,
-			)
+		for (const [totalBytes, expected] of sizes) {
+			const text = renderSystemInfo(makeInfo({ memory: { totalBytes, freeBytes: 0 } }), 100)
 				.join("\n")
 				.replace(/[ \t]+/g, " ");
-			expect(text).toContain(`${expected} w.gguf`);
+			expect(text, String(totalBytes)).toContain(`installed ${expected}`);
 		}
-		// Memory uses the same scale, and a bogus free figure cannot exceed installed.
-		const mem = renderSystemInfo(
+	});
+
+	test("a free figure larger than installed cannot read as negative use", () => {
+		const text = renderSystemInfo(
 			makeInfo({ memory: { totalBytes: 64 * GIB, freeBytes: 999 * GIB } }),
 			100,
 		).join("\n");
-		expect(mem).toContain("64.0 GiB");
-		expect(mem).toContain("0%");
+		expect(text).toContain("64.0 GiB");
+		expect(text).toContain("0%");
+		// A signed byte figure would mean the clamp let used bytes go negative. Scoped
+		// to the memory block: model names legitimately contain "-30b"-shaped text.
+		const inUse = text.split("\n").find((line) => line.includes("in use")) ?? "";
+		expect(inUse).not.toMatch(/-\d/);
+	});
+
+	test("a fully used machine reads as 100%, and an idle one as 0%", () => {
+		const full = renderSystemInfo(
+			makeInfo({ memory: { totalBytes: 64 * GIB, freeBytes: 0 } }),
+			100,
+		).join("\n");
+		expect(full).toContain("100%");
+
+		const idle = renderSystemInfo(
+			makeInfo({ memory: { totalBytes: 64 * GIB, freeBytes: 64 * GIB } }),
+			100,
+		).join("\n");
+		expect(idle).toContain("0%");
+		expect(idle).not.toContain("100%");
 	});
 });
 
 describe("collectSystemInfo", () => {
 	test("describes this machine without throwing", async () => {
-		const info = await collectSystemInfo({ config: DEFAULT_CONFIG, engineRunning: false });
+		const info = await collectSystemInfo(DEFAULT_CONFIG);
 		expect(info.cpu.logicalCores).toBeGreaterThanOrEqual(1);
 		expect(info.memory.totalBytes).toBeGreaterThan(0);
 		expect(info.os.platform.length).toBeGreaterThan(0);
 		expect(info.uptimeSec).toBeGreaterThanOrEqual(0);
 		expect(info.runtime.bun.length).toBeGreaterThan(0);
 		expect(info.runtime.nodeApi.length).toBeGreaterThan(0);
-		expect(info.engine.running).toBe(false);
-		expect(info.engine.endpoint).toBe(DEFAULT_CONFIG.endpoint);
-		// Either no NVIDIA stack at all, or every reported card has real VRAM.
-		for (const gpu of info.gpus) {
-			expect(gpu.memoryTotalMiB).toBeGreaterThan(0);
-			expect(gpu.memoryUsedMiB).toBeGreaterThanOrEqual(0);
-			expect(gpu.name.length).toBeGreaterThan(0);
-		}
 		if (info.cpu.physicalCores !== undefined) {
 			expect(info.cpu.physicalCores).toBeGreaterThanOrEqual(1);
 			expect(info.cpu.physicalCores).toBeLessThanOrEqual(info.cpu.logicalCores);
@@ -273,40 +242,39 @@ describe("collectSystemInfo", () => {
 		}
 	}, 20_000);
 
-	test("lists only top-level gguf weights, largest first", async () => {
-		const modelsDir = tempDir();
-		fs.writeFileSync(path.join(modelsDir, "small.gguf"), Buffer.alloc(2048));
-		fs.writeFileSync(path.join(modelsDir, "big.gguf"), Buffer.alloc(8192));
-		fs.writeFileSync(path.join(modelsDir, "notes.txt"), "not a model");
-		fs.mkdirSync(path.join(modelsDir, "nested"));
-		fs.writeFileSync(path.join(modelsDir, "nested", "hidden.gguf"), Buffer.alloc(4096));
-
+	test("the endpoint block is read from config, with no network at all", async () => {
+		// A port nothing is listening on: collection must not care.
 		const config: OgConfig = {
 			...DEFAULT_CONFIG,
-			engine: { ...DEFAULT_CONFIG.engine, modelsDir, binDir: path.join(modelsDir, "no-such-bin") },
+			endpoint: "http://127.0.0.1:1",
+			model: "qwen3-coder-30b-long",
 		};
-		const info = await collectSystemInfo({ config, engineRunning: true });
-		expect(info.engine.weights).toEqual([
-			{ file: "big.gguf", bytes: 8192 },
-			{ file: "small.gguf", bytes: 2048 },
-		]);
-		// An absent binDir is a missing probe, not an error: both fields drop out.
-		expect(info.engine.resolvedBuild).toBeUndefined();
-		expect(info.engine.serverVersion).toBeUndefined();
-		expect(info.engine.running).toBe(true);
+		const info = await collectSystemInfo(config);
+		expect(info.endpoint).toEqual({
+			url: "http://127.0.0.1:1",
+			model: "qwen3-coder-30b-long",
+			contextWindow: 65536,
+		});
 	}, 20_000);
 
-	test("treats a missing models directory as no weights", async () => {
+	test("a per-model endpoint and wire id are what /stats reports", async () => {
 		const config: OgConfig = {
 			...DEFAULT_CONFIG,
-			engine: {
-				...DEFAULT_CONFIG.engine,
-				modelsDir: path.join(tempDir(), "definitely-absent"),
-				binDir: path.join(tempDir(), "definitely-absent"),
+			endpoint: "http://127.0.0.1:8127",
+			model: "hosted",
+			models: {
+				hosted: {
+					id: "deepseek-chat",
+					endpoint: "https://api.deepseek.com",
+					contextWindow: 131_072,
+				},
 			},
 		};
-		const info = await collectSystemInfo({ config, engineRunning: false });
-		expect(info.engine.weights).toEqual([]);
-		expect(renderSystemInfo(info, 80).join("\n")).toContain("none found");
+		const info = await collectSystemInfo(config);
+		expect(info.endpoint).toEqual({
+			url: "https://api.deepseek.com",
+			model: "deepseek-chat",
+			contextWindow: 131_072,
+		});
 	}, 20_000);
 });

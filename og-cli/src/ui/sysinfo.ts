@@ -1,12 +1,16 @@
 /**
- * Machine and inference-stack introspection, backing `/stats`.
+ * Machine and runtime introspection, backing `/stats`.
  *
  * Collection is deliberately split from rendering: `collectSystemInfo` is the
- * only part that touches the OS, spawns probes or reads the filesystem, and
- * every one of those probes is best effort — a missing `nvidia-smi`, an absent
- * models directory or a llama.cpp build that predates `--version` yields an
- * omitted optional field or an empty array, never a rejected promise. That way
- * `/stats` still reports what it *can* see on a half-provisioned machine.
+ * only part that touches the OS or spawns a probe, and every probe is best
+ * effort — a core-count query that is absent, refused or slow yields an omitted
+ * optional field, never a rejected promise. That way `/stats` still reports
+ * what it *can* see on a locked-down machine.
+ *
+ * Nothing here speaks to the endpoint: the inference server lives on the far
+ * side of HTTP, in another process this CLI does not own. The endpoint block
+ * therefore reports what the client is configured to send, not what a server
+ * answered.
  *
  * `renderSystemInfo` is pure and total: same input, same lines, and every line
  * fits the requested width so the caller can drop them straight into a pinned
@@ -15,52 +19,29 @@
 
 import fs from "node:fs";
 import os from "node:os";
-import path from "node:path";
 
+import { endpointOf, modelSpecOf, wireModelOf } from "../config/load.ts";
 import type { OgConfig } from "../config/schema.ts";
-import { bold, dim, elapsed, formatBytes, green, progressBar, red, truncateLine } from "./render.ts";
-
-export interface GpuInfo {
-	name: string;
-	memoryTotalMiB: number;
-	memoryUsedMiB: number;
-	driverVersion: string;
-	computeCap: string;
-	utilizationPct?: number;
-	temperatureC?: number;
-}
-
-export interface WeightsInfo {
-	file: string;
-	bytes: number;
-}
+import { bold, dim, elapsed, formatBytes, progressBar, truncateLine } from "./render.ts";
 
 export interface SystemInfo {
 	os: { platform: string; release: string; arch: string; hostname: string };
 	cpu: { model: string; physicalCores?: number; logicalCores: number; speedMHz: number };
 	memory: { totalBytes: number; freeBytes: number };
-	gpus: GpuInfo[];
 	runtime: { bun: string; nodeApi: string };
-	engine: {
-		binDir: string;
-		resolvedBuild?: string;
-		serverVersion?: string;
-		endpoint: string;
-		running: boolean;
-		modelsDir: string;
-		weights: WeightsInfo[];
-	};
+	/** Where chat requests go and under what name; configuration, not a probe. */
+	endpoint: { url: string; model: string; contextWindow: number };
 	uptimeSec: number;
 }
 
 const MIB = 1024 * 1024;
 const GIB = 1024 * 1024 * 1024;
 
-/** Probe timeout. `--version` and `nvidia-smi` answer in milliseconds; a hang is a broken install. */
+/** Probe timeout. A core-count query answers in milliseconds; a hang is a broken machine. */
 const PROBE_TIMEOUT_MS = 5_000;
 
 interface Capture {
-	/** stdout and stderr concatenated: llama.cpp prints its banner to either, depending on build. */
+	/** stdout and stderr concatenated: probes are not consistent about which one they answer on. */
 	text: string;
 	exitCode: number | null;
 	timedOut: boolean;
@@ -152,118 +133,10 @@ async function readPhysicalCores(): Promise<number | undefined> {
 	return undefined;
 }
 
-/** Optional numeric CSV cell: `[N/A]`, blank and garbage all mean "not reported". */
-function optionalNumber(cell: string | undefined): number | undefined {
-	const value = Number.parseFloat((cell ?? "").trim());
-	return Number.isFinite(value) ? value : undefined;
-}
-
-/**
- * One entry per NVIDIA GPU. The query string must stay a single argv element:
- * the commas inside it are field separators for nvidia-smi, not shell syntax.
- */
-async function readGpus(): Promise<GpuInfo[]> {
-	const result = await capture(
-		[
-			"nvidia-smi",
-			"--query-gpu=name,memory.total,memory.used,driver_version,compute_cap,utilization.gpu,temperature.gpu",
-			"--format=csv,noheader,nounits",
-		],
-		PROBE_TIMEOUT_MS,
-	);
-	if (!result || result.timedOut || result.exitCode !== 0) return [];
-	const gpus: GpuInfo[] = [];
-	for (const line of result.text.split(/\r?\n/)) {
-		if (line.trim() === "") continue;
-		const cells = line.split(",").map((cell) => cell.trim());
-		const name = cells[0] ?? "";
-		const total = optionalNumber(cells[1]);
-		const used = optionalNumber(cells[2]);
-		// Without a name and a VRAM pair the row says nothing worth printing.
-		if (name === "" || total === undefined || used === undefined) continue;
-		const utilization = optionalNumber(cells[5]);
-		const temperature = optionalNumber(cells[6]);
-		gpus.push({
-			name,
-			memoryTotalMiB: total,
-			memoryUsedMiB: used,
-			driverVersion: cells[3] ?? "",
-			computeCap: cells[4] ?? "",
-			...(utilization !== undefined ? { utilizationPct: utilization } : {}),
-			...(temperature !== undefined ? { temperatureC: temperature } : {}),
-		});
-	}
-	return gpus;
-}
-
-/**
- * Build tag behind `binDir`. The install layout is a `current` junction onto a
- * versioned directory, so the interesting name is the *target's* last segment;
- * a plain directory has nothing extra to report.
- */
-function resolveBuild(binDir: string): string | undefined {
-	try {
-		const declared = path.resolve(binDir);
-		const real = fs.realpathSync(declared);
-		const unchanged =
-			process.platform === "win32" ? real.toLowerCase() === declared.toLowerCase() : real === declared;
-		if (unchanged) return undefined;
-		const segment = path.basename(real);
-		return segment === "" ? undefined : segment;
-	} catch {
-		return undefined;
-	}
-}
-
-/** `--version` banner line from llama-server. It exits immediately; no server is started. */
-async function readServerVersion(binDir: string): Promise<string | undefined> {
-	const bin = path.join(binDir, process.platform === "win32" ? "llama-server.exe" : "llama-server");
-	const result = await capture([bin, "--version"], PROBE_TIMEOUT_MS);
-	if (!result || result.timedOut) return undefined;
-	for (const line of result.text.split(/\r?\n/)) {
-		const trimmed = line.trim();
-		if (trimmed.toLowerCase().startsWith("version:")) return trimmed;
-	}
-	return undefined;
-}
-
-/** GGUF files directly in `modelsDir`, largest first. Shards of one model sort together. */
-function readWeights(modelsDir: string): WeightsInfo[] {
-	let entries: fs.Dirent[];
-	try {
-		entries = fs.readdirSync(modelsDir, { withFileTypes: true });
-	} catch {
-		return [];
-	}
-	const weights: WeightsInfo[] = [];
-	for (const entry of entries) {
-		if (!entry.isFile()) continue;
-		if (!entry.name.toLowerCase().endsWith(".gguf")) continue;
-		try {
-			const stat = fs.statSync(path.join(modelsDir, entry.name));
-			weights.push({ file: entry.name, bytes: stat.size });
-		} catch {
-			/* vanished or unreadable between listing and stat */
-		}
-	}
-	weights.sort((a, b) => b.bytes - a.bytes || a.file.localeCompare(b.file));
-	return weights;
-}
-
-export async function collectSystemInfo(input: {
-	config: OgConfig;
-	engineRunning: boolean;
-}): Promise<SystemInfo> {
-	const { config, engineRunning } = input;
+export async function collectSystemInfo(config: OgConfig): Promise<SystemInfo> {
 	const cpus = os.cpus();
 	const first = cpus[0];
-	// Independent probes; each already swallows its own failures.
-	const [physicalCores, gpus, serverVersion] = await Promise.all([
-		readPhysicalCores(),
-		readGpus(),
-		readServerVersion(config.engine.binDir),
-	]);
-	const resolvedBuild = resolveBuild(config.engine.binDir);
+	const physicalCores = await readPhysicalCores();
 	const speed = first?.speed ?? 0;
 	let hostname = "";
 	try {
@@ -281,25 +154,20 @@ export async function collectSystemInfo(input: {
 			speedMHz: Number.isFinite(speed) && speed > 0 ? speed : 0,
 		},
 		memory: { totalBytes: os.totalmem(), freeBytes: os.freemem() },
-		gpus,
 		runtime: { bun: Bun.version, nodeApi: process.versions.node },
-		engine: {
-			binDir: config.engine.binDir,
-			...(resolvedBuild !== undefined ? { resolvedBuild } : {}),
-			...(serverVersion !== undefined ? { serverVersion } : {}),
-			endpoint: config.endpoint,
-			running: engineRunning,
-			modelsDir: config.engine.modelsDir,
-			weights: readWeights(config.engine.modelsDir),
+		endpoint: {
+			url: endpointOf(config),
+			model: wireModelOf(config),
+			contextWindow: modelSpecOf(config).contextWindow,
 		},
 		uptimeSec: Math.max(0, Math.round(os.uptime())),
 	};
 }
 
 /**
- * GiB/MiB with one decimal, the resolution people compare weights and VRAM at.
- * The unit is chosen from the *rounded* value, so a hair under a gibibyte reads
- * as `1.0 GiB` rather than the self-contradicting `1024.0 MiB`. Sub-mebibyte
+ * GiB/MiB with one decimal, the resolution people compare memory at. The unit
+ * is chosen from the *rounded* value, so a hair under a gibibyte reads as
+ * `1.0 GiB` rather than the self-contradicting `1024.0 MiB`. Sub-mebibyte
  * values fall through to the shared byte formatter.
  */
 function formatSize(bytes: number): string {
@@ -318,15 +186,10 @@ function fractionOf(used: number, total: number): number {
 }
 
 const LABEL_WIDTH = 10;
-const SUB_LABEL_WIDTH = 8;
 
-/** `  label      value`; `sub` indents deeper but keeps the same value column. */
+/** `  label      value`; one indent, one value column, every section. */
 function entry(label: string, value: string): string {
 	return `  ${dim(label.padEnd(LABEL_WIDTH))} ${value}`;
-}
-
-function sub(label: string, value: string): string {
-	return `    ${dim(label.padEnd(SUB_LABEL_WIDTH))} ${value}`;
 }
 
 export function renderSystemInfo(info: SystemInfo, width: number): string[] {
@@ -373,52 +236,14 @@ export function renderSystemInfo(info: SystemInfo, width: number): string[] {
 	);
 	lines.push(entry("free", formatSize(freeBytes)));
 
-	section("gpu");
-	if (info.gpus.length === 0) {
-		lines.push(`  ${dim("no NVIDIA GPU detected")}`);
-	} else {
-		info.gpus.forEach((gpu, index) => {
-			lines.push(entry(`gpu ${index}`, gpu.name));
-			const vramFraction = fractionOf(gpu.memoryUsedMiB, gpu.memoryTotalMiB);
-			// Raw MiB, because that is the unit every GPU tool and llama.cpp log uses.
-			const used = Number.isFinite(gpu.memoryUsedMiB) ? Math.round(gpu.memoryUsedMiB) : 0;
-			const total = Number.isFinite(gpu.memoryTotalMiB) ? Math.round(gpu.memoryTotalMiB) : 0;
-			lines.push(
-				sub(
-					"vram",
-					`${progressBar(vramFraction, 10)} ${Math.round(vramFraction * 100)}% ${used} / ${total} MiB`,
-				),
-			);
-			const identity: string[] = [];
-			if (gpu.driverVersion !== "") identity.push(`driver ${gpu.driverVersion}`);
-			if (gpu.computeCap !== "") identity.push(`compute ${gpu.computeCap}`);
-			if (identity.length > 0) lines.push(sub("device", identity.join(" \u00b7 ")));
-			const load: string[] = [];
-			if (gpu.utilizationPct !== undefined) load.push(`${Math.round(gpu.utilizationPct)}% util`);
-			if (gpu.temperatureC !== undefined) load.push(`${Math.round(gpu.temperatureC)}\u00b0C`);
-			if (load.length > 0) lines.push(sub("load", load.join(" \u00b7 ")));
-		});
-	}
-
 	section("runtime");
 	lines.push(entry("bun", info.runtime.bun));
 	lines.push(entry("node api", info.runtime.nodeApi));
 
-	section("engine");
-	lines.push(entry("bin dir", info.engine.binDir));
-	if (info.engine.resolvedBuild !== undefined) lines.push(entry("build", info.engine.resolvedBuild));
-	if (info.engine.serverVersion !== undefined) lines.push(entry("server", info.engine.serverVersion));
-	lines.push(
-		entry("endpoint", `${info.engine.endpoint} ${info.engine.running ? green("reachable") : red("unreachable")}`),
-	);
-	lines.push(entry("models dir", info.engine.modelsDir));
-	const weights = info.engine.weights;
-	if (weights.length === 0) {
-		lines.push(entry("weights", dim("none found")));
-	} else {
-		lines.push(entry("weights", `${weights.length} file${weights.length === 1 ? "" : "s"}`));
-		for (const weight of weights) lines.push(sub(formatSize(weight.bytes), weight.file));
-	}
+	section("endpoint");
+	lines.push(entry("url", info.endpoint.url));
+	lines.push(entry("model", info.endpoint.model));
+	lines.push(entry("context", `${info.endpoint.contextWindow} tok`));
 
 	return lines.map((line) => truncateLine(line, cols));
 }

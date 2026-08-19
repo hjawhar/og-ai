@@ -18,7 +18,7 @@ import { createAgent } from "../src/agent/loop.ts";
 import type { Agent, AgentEvent } from "../src/agent/types.ts";
 import { DEFAULT_CONFIG } from "../src/config/load.ts";
 import type { OgConfig } from "../src/config/schema.ts";
-import type { ChatRequest, Provider, StreamEvent } from "../src/provider/types.ts";
+import type { ChatRequest, EndpointHealth, Provider, StreamEvent } from "../src/provider/types.ts";
 import { ProviderError } from "../src/provider/types.ts";
 import { openSessionStore } from "../src/session/store.ts";
 import type { SessionStore } from "../src/session/types.ts";
@@ -39,6 +39,7 @@ const DONE_TOOLS: StreamEvent = { type: "done", finishReason: "tool_calls" };
 class FakeProvider implements Provider {
 	readonly id = "fake";
 	readonly model = "fake-model";
+	readonly endpoint = "http://127.0.0.1:8127";
 	readonly nativeToolCalls = true;
 	readonly contextWindow: number;
 	/** Every request the loop made, in order, including the history it sent. */
@@ -63,12 +64,8 @@ class FakeProvider implements Provider {
 		for (const ev of step) yield ev;
 	}
 
-	countTokens(text: string): Promise<number> {
-		return Promise.resolve(Math.ceil(text.length / 3.6));
-	}
-
-	health(): Promise<boolean> {
-		return Promise.resolve(true);
+	health(): Promise<EndpointHealth> {
+		return Promise.resolve({ reachable: true, status: 200 });
 	}
 }
 
@@ -677,5 +674,93 @@ describe("history continuity", () => {
 		expect(h.store.messages(h.sessionId).at(-1)?.content).toBe("second answer");
 		// The title still reflects the first prompt of the session.
 		expect(h.store.get(h.sessionId)?.title).toBe("first question");
+	});
+});
+
+describe("sampling from the active model spec", () => {
+	const TEXT_TURN: ScriptStep[] = [[{ type: "text", delta: "hi" }, DONE_STOP]];
+
+	test("every knob the spec sets reaches the ChatRequest", async () => {
+		const h = harness({
+			script: TEXT_TURN,
+			patch: (cfg) => {
+				cfg.model = "tuned";
+				cfg.models["tuned"] = {
+					contextWindow: 16384,
+					temperature: 0.65,
+					maxTokens: 2048,
+					topP: 0.85,
+					topK: 40,
+					minP: 0.05,
+					repeatPenalty: 1.1,
+				};
+			},
+		});
+
+		await drain(h.agent, "go");
+		const req = h.provider.requests[0];
+		expect(req).toBeDefined();
+		expect(req?.temperature).toBe(0.65);
+		expect(req?.maxTokens).toBe(2048);
+		expect(req?.topP).toBe(0.85);
+		expect(req?.topK).toBe(40);
+		expect(req?.minP).toBe(0.05);
+		expect(req?.repeatPenalty).toBe(1.1);
+		// The spec's numbers, not the agent block's, which differ on every field.
+		expect(h.config.agent.temperature).not.toBe(0.65);
+		expect(h.config.agent.maxTokens).not.toBe(2048);
+	});
+
+	test("agent.temperature and agent.maxTokens are the fallbacks", async () => {
+		const h = harness({
+			script: TEXT_TURN,
+			patch: (cfg) => {
+				cfg.model = "bare";
+				// A pass-through model: nothing but a window is known about it.
+				cfg.models["bare"] = { contextWindow: 16384 };
+				cfg.agent.temperature = 0.2;
+				cfg.agent.maxTokens = 8192;
+			},
+		});
+
+		await drain(h.agent, "go");
+		const req = h.provider.requests[0];
+		expect(req?.temperature).toBe(0.2);
+		expect(req?.maxTokens).toBe(8192);
+		// There is no agent-level default for the llama.cpp extensions: an unset
+		// knob must stay off the wire rather than acquire a guessed value, because
+		// OpenAI proper rejects request fields it does not recognise.
+		expect(req?.topP).toBeUndefined();
+		expect(req?.topK).toBeUndefined();
+		expect(req?.minP).toBeUndefined();
+		expect(req?.repeatPenalty).toBeUndefined();
+	});
+
+	test("minP zero and other falsey knobs are still sent", async () => {
+		const h = harness({
+			script: TEXT_TURN,
+			patch: (cfg) => {
+				cfg.model = "zeroed";
+				cfg.models["zeroed"] = { contextWindow: 16384, minP: 0, topP: 0, temperature: 0 };
+			},
+		});
+
+		await drain(h.agent, "go");
+		const req = h.provider.requests[0];
+		expect(req?.minP).toBe(0);
+		expect(req?.topP).toBe(0);
+		expect(req?.temperature).toBe(0);
+	});
+
+	test("the shipped default model sends the measured Qwen sampling", async () => {
+		const h = harness({ script: TEXT_TURN });
+		await drain(h.agent, "go");
+		const req = h.provider.requests[0];
+		// DEFAULT_CONFIG's active model sets no temperature, so the agent block wins.
+		expect(req?.temperature).toBe(DEFAULT_CONFIG.agent.temperature);
+		expect(req?.topP).toBe(0.8);
+		expect(req?.topK).toBe(20);
+		expect(req?.minP).toBe(0);
+		expect(req?.repeatPenalty).toBe(1.05);
 	});
 });

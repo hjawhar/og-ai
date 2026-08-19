@@ -8,7 +8,11 @@
 
 import { afterEach, describe, expect, test } from "bun:test";
 
+import { DEFAULT_CONFIG } from "../src/config/load.ts";
+import { ConfigError } from "../src/config/schema.ts";
+import type { ModelSpec, OgConfig } from "../src/config/schema.ts";
 import { OpenAIProvider } from "../src/provider/openai.ts";
+import { createProvider } from "../src/provider/registry.ts";
 import { ProviderError, type Message, type StreamEvent, type ToolSpec } from "../src/provider/types.ts";
 
 const servers: Bun.Server<undefined>[] = [];
@@ -412,62 +416,290 @@ describe("outgoing request payload", () => {
 
 		expect(Object.keys(body ?? {}).sort()).toEqual(["messages", "model", "stream", "stream_options"]);
 	});
-});
 
-describe("countTokens", () => {
-	test("uses /tokenize when the backend provides it", async () => {
+	test("sampling knobs are sent under their OpenAI-compatible wire names", async () => {
+		let body: Record<string, unknown> | undefined;
 		const endpoint = serve(async (req) => {
-			expect(new URL(req.url).pathname).toBe("/tokenize");
-			const payload = (await req.json()) as { content: string };
-			return Response.json({ tokens: [...payload.content].map((_, i) => i) });
+			body = (await req.json()) as Record<string, unknown>;
+			return sse([FINISH_STOP, DONE]);
 		});
-		expect(await provider(endpoint).countTokens("abcdefghij")).toBe(10);
+		await collect(
+			provider(endpoint).chat({
+				messages: [{ role: "user", content: "hi" }],
+				temperature: 0.2,
+				maxTokens: 4096,
+				topP: 0.8,
+				topK: 20,
+				minP: 0,
+				repeatPenalty: 1.05,
+			}),
+		);
+
+		expect(body?.["temperature"]).toBe(0.2);
+		expect(body?.["max_tokens"]).toBe(4096);
+		expect(body?.["top_p"]).toBe(0.8);
+		expect(body?.["top_k"]).toBe(20);
+		// Zero is a meaningful min-p, so presence — not truthiness — decides.
+		expect(body?.["min_p"]).toBe(0);
+		expect(body?.["repeat_penalty"]).toBe(1.05);
 	});
 
-	test("falls back to ceil(len / 3.6) and stops retrying once /tokenize 404s", async () => {
-		let requests = 0;
-		const endpoint = serve(() => {
-			requests += 1;
-			return new Response("not found", { status: 404 });
+	test("each extension appears only when its own field is set", async () => {
+		// OpenAI proper rejects unknown request fields outright, so a knob og was
+		// not asked for must not appear at all — not even as null.
+		let body: Record<string, unknown> | undefined;
+		const endpoint = serve(async (req) => {
+			body = (await req.json()) as Record<string, unknown>;
+			return sse([FINISH_STOP, DONE]);
 		});
-		const client = provider(endpoint);
-		const text = "x".repeat(100);
+		await collect(
+			provider(endpoint).chat({ messages: [{ role: "user", content: "hi" }], topK: 20 }),
+		);
 
-		expect(await client.countTokens(text)).toBe(Math.ceil(100 / 3.6));
-		expect(await client.countTokens(text)).toBe(28);
-		expect(requests).toBe(1);
+		expect(Object.keys(body ?? {}).sort()).toEqual([
+			"messages",
+			"model",
+			"stream",
+			"stream_options",
+			"top_k",
+		]);
 	});
 
-	test("a tokenize response without a tokens array falls back to the estimate", async () => {
-		const endpoint = serve(() => Response.json({ error: "unsupported" }));
-		expect(await provider(endpoint).countTokens("abc")).toBe(1);
+	test("configured headers are merged in but cannot displace og's own", async () => {
+		let seen: Headers | undefined;
+		const endpoint = serve((req) => {
+			seen = req.headers;
+			return sse([FINISH_STOP, DONE]);
+		});
+
+		const client = new OpenAIProvider({
+			endpoint,
+			model: "test-model",
+			apiKey: "secret-key",
+			contextWindow: 32768,
+			id: "qwen3-coder-30b",
+			headers: {
+				"http-referer": "https://og.local",
+				"x-title": "og",
+				// A gateway config must not be able to break JSON transport or
+				// silently downgrade the bearer token og resolved.
+				"content-type": "text/plain",
+				authorization: "Bearer attacker",
+			},
+		});
+		await collect(client.chat({ messages: [{ role: "user", content: "hi" }] }));
+
+		expect(seen?.get("http-referer")).toBe("https://og.local");
+		expect(seen?.get("x-title")).toBe("og");
+		expect(seen?.get("content-type")).toBe("application/json");
+		expect(seen?.get("authorization")).toBe("Bearer secret-key");
 	});
 });
 
 describe("health", () => {
-	test("true when /health reports ok", async () => {
-		const endpoint = serve(() => Response.json({ status: "ok" }));
-		expect(await provider(endpoint).health()).toBe(true);
+	test("one GET to /v1/models is the whole probe", async () => {
+		const routes: string[] = [];
+		const endpoint = serve((req) => {
+			routes.push(`${req.method} ${new URL(req.url).pathname}`);
+			return Response.json({ data: [{ id: "test-model" }] });
+		});
+
+		expect(await provider(endpoint).health()).toEqual({ reachable: true, status: 200 });
+		// Exactly one request: every OpenAI-compatible server exposes this route,
+		// and a second probe could not tell reachability apart from the first,
+		// because a transport failure fails per host rather than per path.
+		expect(routes).toEqual(["GET /v1/models"]);
 	});
 
-	test("falls back to /v1/models when /health is absent", async () => {
-		const endpoint = serve((req) =>
-			new URL(req.url).pathname === "/v1/models"
-				? Response.json({ data: [{ id: "test-model" }] })
-				: new Response("nope", { status: 404 }),
-		);
-		expect(await provider(endpoint).health()).toBe(true);
+	test("a 404 model list is still an answer: something is listening", async () => {
+		// The preflight's only job is to tell "nothing is listening" from "the
+		// server disagrees with you", so any HTTP status settles it and the
+		// server's own error text is what the user goes on to see.
+		const routes: string[] = [];
+		const endpoint = serve((req) => {
+			routes.push(new URL(req.url).pathname);
+			return new Response("nope", { status: 404 });
+		});
+		expect(await provider(endpoint).health()).toEqual({ reachable: true, status: 404 });
+		expect(routes).toEqual(["/v1/models"]);
 	});
 
-	test("false while the model is still loading", async () => {
+	test("a 401 is reachable: an auth failure is the server talking", async () => {
+		const endpoint = serve(() => new Response("invalid api key", { status: 401 }));
+		expect(await provider(endpoint).health()).toEqual({ reachable: true, status: 401 });
+	});
+
+	test("a 503 from a server still warming up is reachable, not missing", async () => {
 		const endpoint = serve(() => new Response("loading model", { status: 503 }));
-		expect(await provider(endpoint).health()).toBe(false);
+		expect(await provider(endpoint).health()).toEqual({ reachable: true, status: 503 });
 	});
 
-	test("false when the endpoint is down", async () => {
+	test("only a transport failure is unreachable, and it explains itself", async () => {
 		const server = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("ok") });
 		const endpoint = `http://127.0.0.1:${server.port}`;
 		server.stop(true);
-		expect(await provider(endpoint).health()).toBe(false);
+
+		const health = await provider(endpoint).health();
+		expect(health.reachable).toBe(false);
+		expect(health.status).toBeUndefined();
+		expect(health.detail).toBeTruthy();
+	});
+});
+
+describe("createProvider", () => {
+	/** Env vars this describe touched, with their pre-test values. */
+	const savedEnv = new Map<string, string | undefined>();
+
+	function setEnv(name: string, value: string | undefined): void {
+		if (!savedEnv.has(name)) savedEnv.set(name, process.env[name]);
+		if (value === undefined) delete process.env[name];
+		else process.env[name] = value;
+	}
+
+	afterEach(() => {
+		for (const [name, value] of savedEnv) {
+			if (value === undefined) delete process.env[name];
+			else process.env[name] = value;
+		}
+		savedEnv.clear();
+	});
+
+	/** `apiKey` is applied only when given, so the no-key case really has none. */
+	function config(model: string, models: Record<string, ModelSpec>, apiKey?: string): OgConfig {
+		return {
+			...DEFAULT_CONFIG,
+			endpoint: "http://127.0.0.1:8127",
+			model,
+			models,
+			...(apiKey === undefined ? {} : { apiKey }),
+		};
+	}
+
+	test("the record key is the wire model name unless the spec overrides it", () => {
+		const aliased = createProvider(
+			config("qwen3-coder-30b", {
+				"qwen3-coder-30b": { id: "Qwen/Qwen3-Coder-30B-A3B-Instruct", contextWindow: 32768 },
+			}),
+		);
+		expect(aliased.model).toBe("Qwen/Qwen3-Coder-30B-A3B-Instruct");
+		// `id` is the config key: sessions and the status bar name the key, not the alias.
+		expect(aliased.id).toBe("qwen3-coder-30b");
+		expect(aliased.contextWindow).toBe(32768);
+
+		const plain = createProvider(config("gpt-4o", { "gpt-4o": { contextWindow: 128_000 } }));
+		expect(plain.model).toBe("gpt-4o");
+	});
+
+	test("a loopback endpoint gets the real model name, never a literal placeholder", () => {
+		// og used to send "local" to any loopback server and ignore the model name.
+		// Every server that matters now serves several models, so the honest name
+		// is the only correct one — and no env var may bring the old behaviour back.
+		setEnv("OG_LOCAL_ENDPOINT", "1");
+		const local = createProvider(
+			config("qwen3-coder-30b", { "qwen3-coder-30b": { contextWindow: 32768 } }),
+		);
+		expect(local.model).toBe("qwen3-coder-30b");
+		expect(local.endpoint).toBe("http://127.0.0.1:8127");
+	});
+
+	test("a per-model endpoint wins over the top-level one", () => {
+		const cfg = config("hosted", {
+			hosted: { endpoint: "https://api.deepseek.com", contextWindow: 65536 },
+			local: { contextWindow: 32768 },
+		});
+		expect(createProvider(cfg).endpoint).toBe("https://api.deepseek.com");
+		expect(createProvider({ ...cfg, model: "local" }).endpoint).toBe("http://127.0.0.1:8127");
+	});
+
+	test("apiKeyEnv reads the named variable and beats the config's own key", async () => {
+		let auth: string | null | undefined;
+		const endpoint = serve((req) => {
+			auth = req.headers.get("authorization");
+			return sse([FINISH_STOP, DONE]);
+		});
+		setEnv("OG_TEST_PROVIDER_KEY", "sk-from-env");
+
+		const client = createProvider(
+			config(
+				"hosted",
+				{ hosted: { apiKeyEnv: "OG_TEST_PROVIDER_KEY", contextWindow: 8192, endpoint } },
+				"sk-from-config",
+			),
+		);
+		await collect(client.chat({ messages: [{ role: "user", content: "hi" }] }));
+		expect(auth).toBe("Bearer sk-from-env");
+	});
+
+	test("an unset or empty apiKeyEnv is a ConfigError, not an anonymous request", () => {
+		for (const value of [undefined, ""]) {
+			setEnv("OG_TEST_PROVIDER_KEY", value);
+			const cfg = config("hosted", {
+				hosted: { apiKeyEnv: "OG_TEST_PROVIDER_KEY", contextWindow: 8192 },
+			});
+
+			let err: unknown;
+			try {
+				createProvider(cfg);
+			} catch (caught) {
+				err = caught;
+			}
+			expect(err, JSON.stringify(value)).toBeInstanceOf(ConfigError);
+			expect((err as Error).message).toContain("hosted");
+			expect((err as Error).message).toContain("OG_TEST_PROVIDER_KEY");
+			// The variable's name may be echoed; a value never can be.
+			expect((err as Error).message).not.toContain("sk-");
+		}
+	});
+
+	test("the config apiKey is used when no apiKeyEnv is named", async () => {
+		let auth: string | null | undefined;
+		const endpoint = serve((req) => {
+			auth = req.headers.get("authorization");
+			return sse([FINISH_STOP, DONE]);
+		});
+		const client = createProvider(
+			config("hosted", { hosted: { contextWindow: 8192, endpoint } }, "sk-from-config"),
+		);
+		await collect(client.chat({ messages: [{ role: "user", content: "hi" }] }));
+		expect(auth).toBe("Bearer sk-from-config");
+	});
+
+	test("no key anywhere means no authorization header at all", async () => {
+		let hasAuth: boolean | undefined;
+		const endpoint = serve((req) => {
+			hasAuth = req.headers.has("authorization");
+			return sse([FINISH_STOP, DONE]);
+		});
+		// DEFAULT_CONFIG ships no `apiKey`, so this config genuinely has none.
+		const cfg = config("local", { local: { contextWindow: 8192, endpoint } });
+		expect(cfg.apiKey).toBeUndefined();
+
+		await collect(createProvider(cfg).chat({ messages: [{ role: "user", content: "hi" }] }));
+		expect(hasAuth).toBe(false);
+	});
+
+	test("spec headers reach the wire", async () => {
+		let seen: Headers | undefined;
+		const endpoint = serve((req) => {
+			seen = req.headers;
+			return sse([FINISH_STOP, DONE]);
+		});
+		const client = createProvider(
+			config("hosted", {
+				hosted: {
+					contextWindow: 8192,
+					endpoint,
+					headers: { "HTTP-Referer": "https://og.local", "X-Title": "og" },
+				},
+			}),
+		);
+		await collect(client.chat({ messages: [{ role: "user", content: "hi" }] }));
+		expect(seen?.get("http-referer")).toBe("https://og.local");
+		expect(seen?.get("x-title")).toBe("og");
+	});
+
+	test("an unknown active model is a ConfigError from the spec lookup", () => {
+		const cfg = config("ghost", { real: { contextWindow: 8192 } });
+		expect(() => createProvider(cfg)).toThrow(ConfigError);
 	});
 });

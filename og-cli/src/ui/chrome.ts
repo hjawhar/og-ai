@@ -8,7 +8,7 @@
  *
  * Idle:
  * ```
- * og ● qwen3-coder-30b · ~/demo-ace · ctx ██░░░░░░░░ 16% 5.2k/32.8k · 12.4k tok ── add peek() to lru
+ * qwen3-coder-30b · ~/demo-ace · 127.0.0.1:8127 · ctx ██░░░░░░░░ 16% 5.2k/32.8k · 12.4k tok ── add peek() to lru
  * ```
  * Running:
  * ```
@@ -31,17 +31,16 @@ import {
 } from "./render.ts";
 
 export interface BarState {
-	/** Active model profile key. */
+	/** Active model key. */
 	model: string;
 	/** Working directory, home-collapsed by the caller. */
 	cwd: string;
+	/** Endpoint the client streams from; only its host[:port] reaches the row. */
+	endpoint: string;
 	contextTokens: number;
 	contextWindow: number;
 	/** Cumulative tokens for this session (prompt + completion). */
 	sessionTokens: number;
-	engineRunning: boolean;
-	/** Free VRAM in MiB, when a GPU was visible. */
-	vramFreeMiB?: number;
 	/** Session title, right-aligned; omitted when empty. */
 	title: string;
 	/** Absent while idle; present for the whole of a run. */
@@ -89,6 +88,20 @@ function shortenPath(path: string, max: number): string {
 	return `\u2026${path.slice(-(max - 1))}`;
 }
 
+/**
+ * Host and port only. The scheme is always http(s) and the path is always the
+ * OpenAI route prefix, so neither earns a column in a row this tight; anything
+ * `URL` refuses to parse is shown verbatim rather than silently blanked.
+ */
+function shortenEndpoint(endpoint: string): string {
+	try {
+		const host = new URL(endpoint).host;
+		return host === "" ? endpoint : host;
+	} catch {
+		return endpoint;
+	}
+}
+
 /** `ctx ██░░░░░░░░ 16% 5.2k/32.8k`, or a short form when the row is tight. */
 function contextSegment(used: number, window: number, compact: boolean): string {
 	if (!Number.isFinite(window) || window <= 0) return dim("ctx ?");
@@ -109,30 +122,24 @@ export function renderBar(state: BarState, width: number): string {
 	const title = state.title.trim();
 	const run = state.run;
 
-	const head =
-		run === undefined
-			? `${state.engineRunning ? green("\u25cf") : red("\u25cb")} ${cyan(state.model)}`
-			: `${spinnerFrame(run.tick)} ${cyan(state.model)}`;
+	const head = run === undefined ? cyan(state.model) : `${spinnerFrame(run.tick)} ${cyan(state.model)}`;
 
 	const pathBudget = Math.max(8, Math.trunc(columns * 0.3));
 	const path = dim(shortenPath(state.cwd, pathBudget));
+	const endpoint = shortenEndpoint(state.endpoint);
 	const tokens = dim(`${formatTokenCount(state.sessionTokens)} tok`);
-	const vram =
-		state.vramFreeMiB === undefined
-			? undefined
-			: state.vramFreeMiB < 700
-				? red(`${state.vramFreeMiB} MiB free`)
-				: dim(`${state.vramFreeMiB} MiB free`);
 
 	const gauge = contextSegment(state.contextTokens, state.contextWindow, false);
 	const gaugeTight = contextSegment(state.contextTokens, state.contextWindow, true);
 
 	const variants: string[][] = [];
 	if (run === undefined) {
-		const base = [head, path, gauge];
-		if (vram !== undefined) variants.push([...base, tokens, vram]);
-		variants.push([...base, tokens]);
-		variants.push(base);
+		// The endpoint is the first segment sacrificed: it is configuration people
+		// set once, where the gauge and the session total change every turn.
+		// An unset endpoint would otherwise leave a dangling separator in the row.
+		if (endpoint !== "") variants.push([head, path, dim(endpoint), gauge, tokens]);
+		variants.push([head, path, gauge, tokens]);
+		variants.push([head, path, gauge]);
 		variants.push([head, gauge]);
 		variants.push([head, gaugeTight]);
 	} else {

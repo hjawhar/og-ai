@@ -1,10 +1,11 @@
 /**
  * System prompt construction.
  *
- * Tuned for Qwen3-Coder-class local models: short, imperative, no role-play
- * padding, no few-shot examples. Small quantised models follow a compact list
- * of hard rules far better than prose, and every token spent here is a token
- * unavailable to the actual task.
+ * Tuned for Qwen3-Coder-class quantised models: short, imperative, no role-play
+ * padding, no few-shot examples. Small models follow a compact list of hard
+ * rules far better than prose, and every token spent here is a token
+ * unavailable to the actual task. It is deliberately model-agnostic beyond
+ * that — larger hosted models lose nothing from the same brevity.
  */
 
 export interface SystemPromptInput {

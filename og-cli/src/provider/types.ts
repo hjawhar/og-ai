@@ -1,7 +1,7 @@
 /**
- * Provider contract. Every inference backend (llama.cpp server, any
- * OpenAI-compatible endpoint) is reduced to this interface so the agent loop
- * never learns backend specifics.
+ * Provider contract. Any OpenAI-compatible endpoint (a local llama.cpp server,
+ * OpenAI itself, a gateway) is reduced to this interface so the agent loop never
+ * learns backend specifics — and so nothing above it can reach a process.
  */
 
 export type Role = "system" | "user" | "assistant" | "tool";
@@ -56,28 +56,46 @@ export interface ChatRequest {
 	tools?: ToolSpec[];
 	temperature?: number;
 	maxTokens?: number;
+	topP?: number;
+	/**
+	 * llama.cpp / vLLM sampling extensions, sent only when set: OpenAI's API
+	 * rejects request fields it does not know.
+	 */
+	topK?: number;
+	minP?: number;
+	repeatPenalty?: number;
 	stop?: string[];
 	signal?: AbortSignal;
 }
 
+/** Outcome of an endpoint reachability probe. */
+export interface EndpointHealth {
+	/** True when the server answered at all — 401 and 404 are answers. */
+	reachable: boolean;
+	/** HTTP status of the probe that answered. */
+	status?: number;
+	/** Transport failure detail when nothing answered. */
+	detail?: string;
+}
+
 export interface ProviderInfo {
-	/** Stable profile id, e.g. "qwen3-coder-30b". */
+	/** Model key from config, e.g. "qwen3-coder-30b". */
 	id: string;
 	/** Model identifier sent to the backend. */
 	model: string;
+	/** Base URL this provider talks to, after any per-model override. */
+	endpoint: string;
 	/** Usable context window in tokens. */
 	contextWindow: number;
-	/** True when the backend natively parses tool calls (llama.cpp --jinja). */
+	/** True when the backend natively parses tool calls (any server with a chat template). */
 	nativeToolCalls: boolean;
 }
 
 export interface Provider extends ProviderInfo {
 	/** Streaming chat completion. Must always terminate with a single `done` event. */
 	chat(req: ChatRequest): AsyncIterable<StreamEvent>;
-	/** Exact token count via backend tokenizer when available, else an estimate. */
-	countTokens(text: string): Promise<number>;
-	/** Resolves when the backend is reachable and has the model loaded. */
-	health(): Promise<boolean>;
+	/** Cheap reachability probe used as a preflight before a run. */
+	health(): Promise<EndpointHealth>;
 }
 
 export class ProviderError extends Error {

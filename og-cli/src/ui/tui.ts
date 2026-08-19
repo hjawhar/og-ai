@@ -1,9 +1,11 @@
-import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { estimateTokens, messageTokens } from "../agent/context.ts";
 import type { Agent, AgentRunOptions } from "../agent/types.ts";
+import { endpointOf, modelSpecOf, wireModelOf } from "../config/load.ts";
+import type { ModelSpec } from "../config/schema.ts";
 import type { Role } from "../provider/types.ts";
 import type { ApprovalRequest } from "../tools/types.ts";
 import { type BarState, collapseHome, renderBar, renderPrompt } from "./chrome.ts";
@@ -13,7 +15,6 @@ import {
 	decideApproval,
 	dim,
 	elapsed,
-	formatBytes,
 	formatContext,
 	formatDiffish,
 	formatError,
@@ -21,7 +22,6 @@ import {
 	formatTokensPerSec,
 	formatToolEnd,
 	formatUsage,
-	formatWarn,
 	green,
 	progressBar,
 	red,
@@ -116,7 +116,7 @@ const NO_KEY: Keypress = { name: "", ctrl: false, str: "" };
 
 /** Interactive REPL. Returns the process exit code. */
 export async function runTui(deps: UiDeps): Promise<number> {
-	const { config, store, supervisor } = deps;
+	const { config, store } = deps;
 	const out = process.stdout;
 	const tty = out.isTTY === true && process.stdin.isTTY === true;
 	const live = new Transcript(out);
@@ -151,7 +151,7 @@ export async function runTui(deps: UiDeps): Promise<number> {
 			completeLine(line, {
 				commands: COMMAND_NAMES,
 				subcommands: COMMAND_SUBCOMMANDS,
-				modelKeys: Object.keys(config.profiles),
+				modelKeys: Object.keys(config.models),
 				cwd: deps.cwd ?? process.cwd(),
 			}),
 	});
@@ -161,10 +161,10 @@ export async function runTui(deps: UiDeps): Promise<number> {
 	const barState: BarState = {
 		model: modelKey,
 		cwd: collapseHome(deps.cwd ?? process.cwd(), homedir()),
+		endpoint: endpointOf(config, modelKey),
 		contextTokens: historyTokens(agent),
-		contextWindow: config.profiles[modelKey]?.contextWindow ?? 0,
+		contextWindow: modelSpecOf(config, modelKey).contextWindow,
 		sessionTokens: 0,
-		engineRunning: false,
 		title: store.get(sessionId)?.title ?? "",
 	};
 
@@ -174,20 +174,6 @@ export async function runTui(deps: UiDeps): Promise<number> {
 		barState.title = store.get(sessionId)?.title ?? barState.title;
 		barState.sessionTokens = totalPromptTokens + totalCompletionTokens;
 		bar.set(renderBar(barState, out.columns ?? 80));
-	};
-
-	/** Engine state is sampled, never polled per keystroke. */
-	const refreshEngine = async (): Promise<void> => {
-		try {
-			const status = await supervisor.status();
-			barState.engineRunning = status.running;
-			if (status.vramUsedMiB !== undefined && status.vramTotalMiB !== undefined) {
-				barState.vramFreeMiB = status.vramTotalMiB - status.vramUsedMiB;
-			}
-		} catch {
-			barState.engineRunning = false;
-		}
-		paintBar();
 	};
 
 	const onResize = (): void => {
@@ -358,7 +344,7 @@ export async function runTui(deps: UiDeps): Promise<number> {
 		// the usage event at the end of a turn, so between turns we track a local
 		// estimate: the persisted history plus whatever has streamed since.
 		let contextTokens = historyTokens(deps.agent);
-		let contextWindow = deps.config.profiles[modelKey]?.contextWindow ?? 0;
+		let contextWindow = modelSpecOf(deps.config, modelKey).contextWindow;
 		let streamedTokens = 0;
 
 		let phase: "prefill" | "generating" = "prefill";
@@ -484,7 +470,6 @@ export async function runTui(deps: UiDeps): Promise<number> {
 			barState.contextTokens = contextTokens;
 			barState.contextWindow = contextWindow;
 			live.breakLine();
-			void refreshEngine();
 		}
 
 		const wall = Date.now() - startedAt;
@@ -518,14 +503,12 @@ export async function runTui(deps: UiDeps): Promise<number> {
 		agent = result.agent;
 		sessionId = result.sessionId;
 		modelKey = result.model;
-		// A different session or profile changes every header field that is not cwd.
+		// A different session or model changes every header field that is not cwd.
 		barState.model = modelKey;
-		barState.contextWindow = config.profiles[modelKey]?.contextWindow ?? 0;
+		barState.endpoint = endpointOf(config, modelKey);
+		barState.contextWindow = modelSpecOf(config, modelKey).contextWindow;
 		barState.contextTokens = historyTokens(agent);
 		barState.title = store.get(sessionId)?.title ?? "";
-		if (result.engineRestartRequired) {
-			live.line(formatWarn(`profile "${modelKey}" needs different weights than the running engine; it is restarted on the next prompt (or run \`og engine stop\`)`));
-		}
 	};
 
 	const slash = async (input: string): Promise<"continue" | "exit"> => {
@@ -548,41 +531,43 @@ export async function runTui(deps: UiDeps): Promise<number> {
 				// `/models` and `/models list` both list; `/model <key>` stays valid
 				// because it is the shape people type from muscle memory.
 				if (action === "" || action === "list") {
-					for (const [key, profile] of Object.entries(config.profiles)) {
+					// Same two-line shape and the same words as `og models`, so the
+					// REPL and the CLI never describe one model two ways.
+					for (const [key, spec] of Object.entries(config.models)) {
 						const mark = key === modelKey ? green("*") : " ";
-						const path = resolveWeights(config, key);
-						live.line(`${mark} ${bold(key)}${key === modelKey ? dim("  (active)") : ""}`);
-						live.line(
-							dim(
-								`    ${profile.file}${path.exists ? ` \u00b7 ${formatBytes(path.bytes)}` : ` \u00b7 ${red("missing")}`}`,
-							),
-						);
-						live.line(
-							dim(
-								`    ctx ${formatTokenCount(profile.ctx)} \u00b7 window ${formatTokenCount(profile.contextWindow)} \u00b7 ngl ${profile.nGpuLayers}${profile.nCpuMoe === undefined ? "" : ` \u00b7 n-cpu-moe ${profile.nCpuMoe}`} \u00b7 kv ${profile.cacheTypeK}/${profile.cacheTypeV} \u00b7 temp ${profile.temperature}`,
-							),
-						);
+						const facts = [`window ${spec.contextWindow}`];
+						if (spec.maxTokens !== undefined) facts.push(`max-tokens ${spec.maxTokens}`);
+						facts.push(...samplingKnobs(spec));
+						// The variable name, never its value: og prints config, not secrets.
+						if (spec.apiKeyEnv !== undefined) facts.push(`key from $${spec.apiKeyEnv}`);
+						live.line(`${mark} ${bold(key.padEnd(22))} ${dim(`${spec.id ?? key} @ ${spec.endpoint ?? config.endpoint}`)}`);
+						live.line(`  ${dim(facts.join(" \u00b7 "))}`);
 					}
-					live.line(dim("/models switch <key> to change model"));
+					live.line(dim("/models switch <key> changes model; /models info <key> shows everything"));
 					return "continue";
 				}
 
 				if (action === "info") {
 					const key = target === "" ? modelKey : target;
-					const profile = config.profiles[key];
-					if (profile === undefined) {
-						live.line(formatError(`unknown profile "${key}" — known: ${Object.keys(config.profiles).join(", ")}`));
+					const spec = config.models[key];
+					if (spec === undefined) {
+						live.line(formatError(`unknown model "${key}" — known: ${Object.keys(config.models).join(", ")}`));
 						return "continue";
 					}
-					const path = resolveWeights(config, key);
+					const knobs = samplingKnobs(spec);
+					const headerKeys = Object.keys(spec.headers ?? {});
 					live.line(bold(key));
-					live.line(dim(`  weights ${path.path}${path.exists ? ` (${formatBytes(path.bytes)})` : ` ${red("(missing)")}`}`));
-					live.line(dim(`  ctx ${profile.ctx} \u00b7 window ${profile.contextWindow} \u00b7 ngl ${profile.nGpuLayers}${profile.nCpuMoe === undefined ? "" : ` \u00b7 n-cpu-moe ${profile.nCpuMoe}`}`));
-					live.line(dim(`  kv ${profile.cacheTypeK}/${profile.cacheTypeV} \u00b7 flash-attn ${profile.flashAttn ? "on" : "off"}`));
+					live.line(dim(`  wire id  ${spec.id ?? key}`));
+					live.line(dim(`  endpoint ${spec.endpoint ?? `${config.endpoint} (top-level default)`}`));
+					// The variable name only: a bearer token must never reach the transcript.
+					live.line(dim(`  api key  ${spec.apiKeyEnv === undefined ? "top-level apiKey" : `$${spec.apiKeyEnv}`}`));
+					live.line(dim(`  headers  ${headerKeys.length === 0 ? "none" : headerKeys.join(", ")}`));
+					live.line(dim(`  window   ${spec.contextWindow} tok`));
 					live.line(
-						dim(
-							`  sampling temp ${profile.temperature}${profile.topP === undefined ? "" : ` \u00b7 top-p ${profile.topP}`}${profile.topK === undefined ? "" : ` \u00b7 top-k ${profile.topK}`}${profile.minP === undefined ? "" : ` \u00b7 min-p ${profile.minP}`}${profile.repeatPenalty === undefined ? "" : ` \u00b7 repeat ${profile.repeatPenalty}`}`,
-						),
+						dim(`  max out  ${spec.maxTokens === undefined ? `${config.agent.maxTokens} (from agent.maxTokens)` : `${spec.maxTokens} tok`}`),
+					);
+					live.line(
+						dim(`  sampling ${knobs.length === 0 ? `temp ${config.agent.temperature} (from agent.temperature)` : knobs.join(" \u00b7 ")}`),
 					);
 					return "continue";
 				}
@@ -593,8 +578,8 @@ export async function runTui(deps: UiDeps): Promise<number> {
 					live.line(formatError("usage: /models switch <key> — see /models list"));
 					return "continue";
 				}
-				if (config.profiles[key] === undefined) {
-					live.line(formatError(`unknown profile "${key}" — known: ${Object.keys(config.profiles).join(", ")}`));
+				if (config.models[key] === undefined) {
+					live.line(formatError(`unknown model "${key}" — known: ${Object.keys(config.models).join(", ")}`));
 					return "continue";
 				}
 				if (key === modelKey) {
@@ -607,27 +592,26 @@ export async function runTui(deps: UiDeps): Promise<number> {
 				return "continue";
 			}
 			case "stats": {
-				live.line(dim("collecting machine and engine info\u2026"));
-				const info = await collectSystemInfo({ config, engineRunning: barState.engineRunning });
+				live.line(dim("collecting machine info\u2026"));
+				const info = await collectSystemInfo(config);
 				for (const line of renderSystemInfo(info, Math.max((out.columns ?? 80) - 2, 32))) live.line(line);
 				return "continue";
 			}
 			case "usage": {
-				const profile = config.profiles[modelKey];
-				const window = profile?.contextWindow ?? 0;
+				const spec = modelSpecOf(config, modelKey);
+				const window = spec.contextWindow;
 				const used = historyTokens(agent);
 				const record = store.get(sessionId);
 				const modelRuns = runs.filter((r) => r.model === modelKey);
 				const last = modelRuns[modelRuns.length - 1];
+				const knobs = samplingKnobs(spec);
 
 				live.line(bold(`model ${modelKey}`));
-				if (profile !== undefined) {
-					live.line(
-						dim(
-							`  ${profile.file} \u00b7 ctx ${formatTokenCount(profile.ctx)} \u00b7 ngl ${profile.nGpuLayers}${profile.nCpuMoe === undefined ? "" : ` \u00b7 n-cpu-moe ${profile.nCpuMoe}`} \u00b7 kv ${profile.cacheTypeK}/${profile.cacheTypeV}`,
-						),
-					);
-				}
+				live.line(
+					dim(
+						`  ${wireModelOf(config, modelKey)} \u00b7 ${endpointOf(config, modelKey)}${knobs.length === 0 ? "" : ` \u00b7 ${knobs.join(" \u00b7 ")}`}`,
+					),
+				);
 
 				live.line(bold("context"));
 				live.line(`  ${formatContext(used, window)}`);
@@ -687,20 +671,8 @@ export async function runTui(deps: UiDeps): Promise<number> {
 				}
 				return "continue";
 			}
-			case "engine": {
-				const status = await supervisor.status();
-				live.line(`${status.running ? green("running") : red("stopped")} ${dim(status.endpoint)}`);
-				if (status.model !== undefined) live.line(dim(`  model ${status.model}`));
-				if (status.pid !== undefined) live.line(dim(`  pid ${status.pid}`));
-				live.line(
-					dim(
-						`  vram ${status.vramUsedMiB === undefined ? "unknown" : `${status.vramUsedMiB}${status.vramTotalMiB === undefined ? "" : ` / ${status.vramTotalMiB}`} MiB`}`,
-					),
-				);
-				return "continue";
-			}
 			case "context": {
-				const window = config.profiles[modelKey]?.contextWindow ?? 0;
+				const window = modelSpecOf(config, modelKey).contextWindow;
 				const byRole = new Map<Role, { count: number; tokens: number }>();
 				let total = 0;
 				for (const message of agent.history()) {
@@ -759,7 +731,8 @@ export async function runTui(deps: UiDeps): Promise<number> {
 				const sessionCompletion = record?.completionTokens ?? 0;
 				live.line(`  ${bold("session")}  ${sessionPrompt}\u2191 ${sessionCompletion}\u2193 = ${sessionPrompt + sessionCompletion} tok`);
 				live.line(`  ${bold("this run")} ${totalPromptTokens}\u2191 ${totalCompletionTokens}\u2193 = ${totalPromptTokens + totalCompletionTokens} tok`);
-				live.line(dim("  local inference: no billed cost"));
+				// og holds no price list and cannot read the endpoint's billing: tokens are the only honest figure.
+				live.line(dim(`  ${endpointOf(config, modelKey)} \u00b7 pricing unknown to og \u2014 convert these totals yourself`));
 				return "continue";
 			}
 			default:
@@ -771,11 +744,11 @@ export async function runTui(deps: UiDeps): Promise<number> {
 	// Reserve the row FIRST: anything printed before the region exists lands on row
 	// 1 and the bar then paints over it.
 	bar.enable();
-	live.line(`${bold("og")}${deps.version === undefined ? "" : dim(` ${deps.version}`)} ${dim(`\u00b7 ${modelKey} \u00b7 ${config.endpoint}`)}`);
+	live.line(`${bold("og")}${deps.version === undefined ? "" : dim(` ${deps.version}`)} ${dim(`\u00b7 ${modelKey} \u00b7 ${endpointOf(config, modelKey)}`)}`);
 	if (deps.workspaceRoot !== undefined) live.line(dim(`workspace ${deps.workspaceRoot}`));
 	const messageCount = store.get(sessionId) === undefined ? 0 : store.messages(sessionId).length;
 	live.line(dim(`session ${sessionId} \u00b7 ${messageCount} message${messageCount === 1 ? "" : "s"} \u00b7 /help for commands`));
-	await refreshEngine();
+	paintBar();
 	// A process that dies with a scroll region installed leaves the user's shell
 	// scrolling inside a sub-window, so tear it down on abnormal exits too.
 	const emergencyRestore = (): void => bar.disable();
@@ -865,7 +838,6 @@ export const COMMAND_NAMES: readonly string[] = [
 	"model",
 	"usage",
 	"stats",
-	"engine",
 	"context",
 	"clear",
 	"sessions",
@@ -881,12 +853,11 @@ export const COMMAND_SUBCOMMANDS: Readonly<Record<string, readonly string[]>> = 
 function helpLines(): string[] {
 	return [
 		`${bold("/help")}                  this list`,
-		`${bold("/models [list]")}         profiles with weights, context and offload split`,
-		`${bold("/models switch <key>")}   change the active model (engine restarts if the weights differ)`,
-		`${bold("/models info <key>")}     everything configured for one profile`,
+		`${bold("/models [list]")}         configured models with endpoint, window and sampling`,
+		`${bold("/models switch <key>")}   change the active model`,
+		`${bold("/models info <key>")}     everything configured for one model`,
 		`${bold("/usage")}                 context occupancy, token usage, decode rate and ttft`,
-		`${bold("/stats")}                 machine specs, GPU state and installed engine`,
-		`${bold("/engine")}                llama-server status, endpoint and VRAM use`,
+		`${bold("/stats")}                 machine specs, runtime and the configured endpoint`,
 		`${bold("/context")}               token usage per role against the context window`,
 		`${bold("/clear")}                 start a fresh session`,
 		`${bold("/sessions")}              recent sessions`,
@@ -897,14 +868,18 @@ function helpLines(): string[] {
 	];
 }
 
-/** Absolute weights path for a profile, with size when it exists. */
-function resolveWeights(config: UiDeps["config"], key: string): { path: string; exists: boolean; bytes: number } {
-	const profile = config.profiles[key];
-	if (profile === undefined) return { path: "", exists: false, bytes: 0 };
-	const path = isAbsolute(profile.file) ? profile.file : join(config.engine.modelsDir, profile.file);
-	try {
-		return { path, exists: true, bytes: statSync(path).size };
-	} catch {
-		return { path, exists: false, bytes: 0 };
-	}
+/**
+ * The sampling knobs a model actually pins, worded exactly as `og models` words
+ * them. Anything unset is left to the endpoint's own default, which is
+ * deliberate: OpenAI rejects `top_k`/`min_p` outright, so those only ever
+ * appear for llama.cpp and vLLM models.
+ */
+function samplingKnobs(spec: ModelSpec): string[] {
+	const parts: string[] = [];
+	if (spec.temperature !== undefined) parts.push(`temp ${spec.temperature}`);
+	if (spec.topP !== undefined) parts.push(`top-p ${spec.topP}`);
+	if (spec.topK !== undefined) parts.push(`top-k ${spec.topK}`);
+	if (spec.minP !== undefined) parts.push(`min-p ${spec.minP}`);
+	if (spec.repeatPenalty !== undefined) parts.push(`repeat-penalty ${spec.repeatPenalty}`);
+	return parts;
 }
