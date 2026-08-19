@@ -53,6 +53,35 @@
   }
 }
 
+// Two labelled rows of ceilings under the memory meter: a key column narrow
+// enough that the numbers line up, and the numbers themselves in the mono face
+// (`font-mono` in the template) so a reader compares digits, not glyph widths.
+.peak {
+  display: grid;
+  grid-template-columns: 3.25rem 1fr;
+  gap: 0.125rem 0.5rem;
+  margin: 0.5rem 0 0;
+  font-size: 0.75rem;
+
+  &__key {
+    margin: 0;
+    font-size: 0.625rem;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    align-self: center;
+    color: var(--ink-dim);
+  }
+
+  &__value {
+    margin: 0;
+    color: var(--ink-bright);
+  }
+
+  &__unit {
+    color: var(--ink-dim);
+  }
+}
+
 .warn {
   color: var(--verdict-no);
 }

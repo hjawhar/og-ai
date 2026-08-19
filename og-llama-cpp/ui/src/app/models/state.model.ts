@@ -26,12 +26,34 @@ export interface Fit {
   readonly measured?: string;
 }
 
+/**
+ * Peak arithmetic throughput of a card, derived server-side from its SM count and
+ * rated boost clock. A ceiling, not a measurement: nothing on this page claims to
+ * have reached it.
+ */
+export interface ComputePeak {
+  /** Architecture and tensor-core generation, e.g. "Blackwell, 5th-gen tensor cores". */
+  readonly arch: string;
+  readonly sm: number;
+  readonly boostGhz: number;
+  /** CUDA cores, FP32 FMA. */
+  readonly fp32Tflops: number;
+  /** Tensor cores, dense FP16 with FP16 accumulate — the published headline. */
+  readonly fp16Tflops: number;
+  /** Tensor cores, dense FP16/BF16 with FP32 accumulate: half of `fp16Tflops` on GeForce. */
+  readonly fp16Fp32AccTflops: number;
+  /** Tensor cores, dense INT8, no sparsity. */
+  readonly int8Tops: number;
+}
+
 export interface Gpu {
   readonly index: number;
   readonly name: string;
   readonly totalMiB: number;
   readonly usedMiB: number;
   readonly freeMiB: number;
+  /** Absent when the card is not in the server's peak table. */
+  readonly peak?: ComputePeak;
 }
 
 export interface Hardware {

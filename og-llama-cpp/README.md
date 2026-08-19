@@ -267,6 +267,20 @@ summed `*_exps.*` tensors, plus the ~900 MiB runtime allowance, against total VR
 Honest arithmetic, not a measurement — the allowance is itself derived from the one case where both
 exist (Q4_K_XL at ctx 32768, `--n-cpu-moe 14`: 13839 MiB computed against 14714 MiB measured).
 
+A third kind of number, kept away from both: the GPU card's **peak** FLOPS and TOPS —
+175.8 TFLOPS dense fp16 and 351.5 TOPS dense int8 on the reference 5070 Ti. It is a ceiling, not a
+measurement, and it is there so a measured 40-odd tok/s can be read for what it is: a
+memory-bandwidth result on a card whose tensor cores are mostly idle. [`ui/server/compute.ts`](ui/server/compute.ts)
+derives it from three inputs — dense per-SM-per-clock issue rates (256 FP32 FLOP, 1024 FP16 tensor
+FLOP with FP16 accumulate, half that with FP32 accumulate, 2048 INT8 OP; identical across Ampere
+GA10x, Ada and consumer Blackwell), the card's SM count, and its rated boost clock. `nvidia-smi`
+supplies neither of the last two: it has no SM-count query field at all, and `clocks.max.sm` reads
+3090 MHz on the reference card against a rated 2452 MHz boost, so deriving peaks from the live clock
+would overstate every figure by 26%. Hence a table of 20 GeForce cards, each row cross-checked in
+[`test/compute.test.ts`](test/compute.test.ts) against NVIDIA's own published FP32 TFLOPS; a card
+that is not in it renders no peak line rather than a guess, and none of these figures ever enters
+`docs/benchmarks.md`.
+
 `Serve` hands the chosen file to [`serve.ts`](serve.ts) — the UI builds no argv of its own, so a
 model launched from the browser runs the same command line as one launched from a terminal — with
 the context from the row's input and the offload split from the verdict, and streams that process's

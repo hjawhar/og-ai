@@ -11,6 +11,7 @@
  * A measured row for the same file and context always wins over the arithmetic.
  */
 import { MEASURED, measuredNote } from "./catalog.ts";
+import type { ComputePeak } from "./compute.ts";
 import { kvCacheMiB, type GgufInfo } from "./gguf.ts";
 
 const MIB = 1024 * 1024;
@@ -52,6 +53,8 @@ export interface Gpu {
 	totalMiB: number;
 	usedMiB: number;
 	freeMiB: number;
+	/** Peak compute for this model of card; absent when it is not in the table. */
+	peak?: ComputePeak;
 }
 
 export interface FitInput {

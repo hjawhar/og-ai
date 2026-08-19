@@ -27,6 +27,24 @@
           <span class="warn">— less free than the budget; close GPU-heavy apps before launching</span>
         }
       </p>
+      @if (card.peak; as peak) {
+        <dl class="peak">
+          <dt class="peak__key">FLOPS</dt>
+          <dd class="peak__value font-mono">
+            {{ peak.fp16Tflops }} TFLOPS <span class="peak__unit">fp16 tensor</span>
+          </dd>
+          <dt class="peak__key">TOPS</dt>
+          <dd class="peak__value font-mono">
+            {{ peak.int8Tops }} TOPS <span class="peak__unit">int8 tensor</span>
+          </dd>
+        </dl>
+        <p class="card__note">
+          Peak, not measured — {{ peak.sm }} SM × {{ peak.boostGhz }} GHz boost,
+          {{ peak.arch }}. Dense rates, no sparsity: FP32 accumulate halves fp16 to
+          {{ peak.fp16Fp32AccTflops }} TFLOPS, and the shaders alone do {{ peak.fp32Tflops }}.
+          Decode is bandwidth-bound and reaches a few percent of any of them.
+        </p>
+      }
     } @else {
       <p class="card__value">none detected</p>
       <p class="card__note">nvidia-smi reported no device.</p>

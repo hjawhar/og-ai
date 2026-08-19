@@ -7,6 +7,7 @@ import { existsSync, realpathSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { computePeak } from "./compute.ts";
 import type { Gpu } from "./fit.ts";
 
 const WIN = process.platform === "win32";
@@ -40,24 +41,30 @@ export interface ServedModel {
 }
 
 export async function readGpus(): Promise<Gpu[]> {
+	// compute_cap selects the per-SM tensor rates; the name selects SM count and
+	// boost clock. nvidia-smi reports neither of the latter two directly.
 	const text = await capture([
 		"nvidia-smi",
-		"--query-gpu=index,name,memory.total,memory.used,memory.free",
+		"--query-gpu=index,name,memory.total,memory.used,memory.free,compute_cap",
 		"--format=csv,noheader,nounits",
 	]);
 	const gpus: Gpu[] = [];
 	for (const line of text.trim().split("\n")) {
 		const parts = line.split(",").map((part) => part.trim());
-		if (parts.length < 5) continue;
+		if (parts.length < 6) continue;
 		const index = Number.parseInt(parts[0] ?? "", 10);
 		const total = Number.parseInt(parts[2] ?? "", 10);
 		if (!Number.isFinite(index) || !Number.isFinite(total)) continue;
+		const name = parts[1] ?? "unknown";
+		const peak = computePeak(name, parts[5] ?? "");
 		gpus.push({
 			index,
-			name: parts[1] ?? "unknown",
+			name,
 			totalMiB: total,
 			usedMiB: Number.parseInt(parts[3] ?? "0", 10),
 			freeMiB: Number.parseInt(parts[4] ?? "0", 10),
+			// exactOptionalPropertyTypes: an unknown card omits the field entirely.
+			...(peak === undefined ? {} : { peak }),
 		});
 	}
 	return gpus;
