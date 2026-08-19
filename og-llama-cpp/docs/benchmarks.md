@@ -1,10 +1,10 @@
 # Measurement record
 
-Every shipped profile number in the `og` CLI (`src/config/load.ts` in the sibling `../../og-cli`
-checkout) comes from this document, and this document comes
-from runs on one machine. It exists so that a future engine upgrade can be validated against
-real prior art instead of vibes, and so that nobody has to re-derive why the fastest number in
-the table is not the default.
+Every serving profile in [`../serve.ts`](../serve.ts) — and every context window the
+sibling `../../og-cli` checkout ships in `src/config/load.ts` — comes from this document, and this
+document comes from runs on one machine. It exists so that a future engine upgrade can be
+validated against real prior art instead of vibes, and so that nobody has to re-derive why the
+fastest number in the table is not the default.
 
 Reproduce with `bun run tools/bench.ts` (raw kernel ceiling) and `bun run tools/profile-sweep.ts`
 (serving profiles); both are cross-platform. The numbers recorded below were produced by the
@@ -47,12 +47,12 @@ optimistic: it excludes the KV cache that dominates VRAM in a real agent session
 what the GPU can do, not what a serving profile will do.
 
 **B. Serving profile — `llama-server`, 6k-token prefill + 256-token generation.**
-One server per case, launched with the exact argv `og` would use: `q8_0` K and V cache, flash
-attention **on**, `-b 2048 -ub 512 --parallel 1 --cont-batching --jinja`. The prompt is
-realistic source text (~4.2 chars/token) sized to 6000 tokens — an agent session with a system
-prompt, tool schemas and a few files read is in exactly that range. VRAM is sampled with
-`nvidia-smi --query-gpu=memory.used,memory.total` **while the model is loaded and serving**, not
-from the GGUF size. Server is torn down between cases so each number is independent.
+One server per case, launched with the same argv [`../serve.ts`](../serve.ts) uses:
+`q8_0` K and V cache, flash attention **on**, `-b 2048 -ub 512 --parallel 1 --cont-batching`,
+`--jinja`. The prompt is realistic source text (~4.2 chars/token) sized to 6000 tokens — an agent
+session with a system prompt, tool schemas and a few files read is in exactly that range. VRAM is
+sampled with `nvidia-smi --query-gpu=memory.used,memory.total` **while the model is loaded and
+serving**, not from the GGUF size. Server is torn down between cases so each number is independent.
 
 Prefill (prompt eval) and generation (eval) throughput are read from the server's own
 `print_timing` output. "Headroom" below is `16303 - vramMiB`.
@@ -164,8 +164,8 @@ reasons, in order of weight:
    Chrome window away from 29.2 tok/s (-64%). The expected value of the extra 8% is negative.
 
 So the default is the fastest configuration that is *robustly* fast. `qwen3-coder-30b-fast`
-remains one flag away (`-m qwen3-coder-30b-fast`, or `/model` in the TUI) for work where
-iteration speed beats precision.
+remains one flag away (`--profile qwen3-coder-30b-fast` when serving, `-m qwen3-coder-30b-fast` in
+a client) for work where iteration speed beats precision.
 
 ### Why `devstral-24b` is capped at 8192
 
@@ -188,8 +188,9 @@ The investigation started because LM Studio, running the same Q4 weights on the 
 roughly 8x slower than the hardware allowed. It was not a bug in LM Studio's inference — it was
 the driver spill above, caused by an offload split that left too little VRAM headroom, with no
 surface anywhere in the UI reporting that weights had been paged to host RAM. Everything
-"worked". That is precisely why `og` reports free VRAM in `og engine status`, warns below 700
-MiB free before a run, and ships measured profiles instead of a slider.
+"worked". That is precisely why the operating points in `../serve.ts` are measured rather
+than a slider, and why `tools/profile-sweep.ts` samples `nvidia-smi` while the model is actually
+serving instead of trusting the GGUF size.
 
 ## 6. End-to-end agent runs
 

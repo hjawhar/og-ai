@@ -4,15 +4,15 @@
 # Upstream ships no Linux CUDA release asset (only `llama-*-bin-win-cuda-*.zip`
 # and CPU/Vulkan/SYCL tarballs for Ubuntu), so on Linux the CUDA backend has to
 # be compiled locally. The layout produced here matches what install-engine.ps1
-# produces on Windows, because `engine.binDir` is a flat directory holding
-# `llama-server` next to every shared library it needs:
+# produces on Windows: a flat directory holding `llama-server` next to every
+# shared library it needs, so serve.ts can spawn it with a bare argv:
 #
 #   ~/.local/llama.cpp/<build>/llama-server, libggml-cuda.so, libcudart.so.13, ...
 #   ~/.local/llama.cpp/current -> <build>
 #
 # Binaries are linked with RPATH=$ORIGIN, so the CUDA runtime is picked up from
-# that same directory: no LD_LIBRARY_PATH, no system-wide CUDA install, and og
-# can spawn the server with a bare argv.
+# that same directory: no LD_LIBRARY_PATH, no system-wide CUDA install, and
+# serve.ts can spawn the server with a bare argv.
 set -euo pipefail
 
 BUILD="${OG_LLAMA_BUILD:-b10488}"
@@ -112,5 +112,17 @@ done
 ln -sfn "$DEST" "$ROOT/current"
 
 echo '--- installed ---'
-ls -1 "$DEST" | sed -n '1,12p'
-"$ROOT/current/llama-server" --version 2>&1 | sed -n '1,6p'
+[[ -x "$DEST/llama-server" ]] || die "no llama-server at $DEST/llama-server"
+printf '%-10s %s\n' 'dir' "$DEST"
+printf '%-10s %s\n' 'size' "$(du -sh "$DEST" | cut -f1)"
+printf '%-10s %s\n' 'version' "$("$ROOT/current/llama-server" --version 2>&1 | sed -n 's/^version: *//p' | head -1)"
+
+# The check that matters, and the reason it is not left to the operator: a build
+# that missed the CUDA backend still installs and still answers requests, ~100x
+# slower, so a silent success here looks like a working install for as long as
+# it takes to wonder why generation crawls. --list-devices prints on stdout;
+# backend load chatter goes to stderr and is merged in so a load failure shows.
+devices=$("$ROOT/current/llama-server" --list-devices 2>&1) || die 'llama-server --list-devices failed'
+printf '%s\n' "$devices" | sed -n 's/^[[:space:]]\{1,\}\(.*:.*\)$/device     \1/p'
+grep -qE '^ *CUDA[0-9]+:' <<<"$devices" ||
+	die "llama-server lists no CUDA device: GGML_CUDA=ON did not take, or libggml-cuda.so / libcudart are missing from $DEST"
