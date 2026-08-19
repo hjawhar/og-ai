@@ -8,6 +8,7 @@
 import { readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import type { ServedModel } from "../provider/types.ts";
 import type { ModelSpec, OgConfig } from "./schema.ts";
 import { ConfigError } from "./schema.ts";
 
@@ -51,46 +52,43 @@ const BASH_DENY_PATTERNS: string[] = [
 	"\\bgit\\s+push\\s+[^\\n]*(--force(?!-with-lease)|\\s-f\\b)[^\\n]*\\b(main|master)\\b",
 ];
 
-/** Qwen3-Coder author-recommended sampling, minus temperature (see below). */
-const QWEN_SAMPLING = {
-	topP: 0.8,
-	topK: 20,
-	minP: 0,
-	repeatPenalty: 1.05,
-} as const;
-
 /**
- * Context window for a model og was not told about — `og -m <name>` against an
- * arbitrary endpoint. Deliberately conservative: budgeting against a window
- * larger than the server's makes the server truncate silently, while budgeting
- * low only costs an earlier compaction. Override with `--context-window`.
+ * Fallback context window, used only for an endpoint that does not say what it
+ * allocated. llama.cpp reports `meta.n_ctx` on `/v1/models`, so a local server's
+ * real window is discovered rather than assumed; a gateway that reports nothing
+ * gets this. Deliberately conservative: budgeting above the server's real window
+ * makes it truncate silently, while budgeting below only costs an earlier
+ * compaction. Override with `--context-window`.
  */
 export const DEFAULT_CONTEXT_WINDOW = 32768;
 
 /**
- * The shipped entries are the operating points measured in
- * og-llama-cpp/docs/benchmarks.md; `contextWindow` is the only number og needs,
- * because the offload split that makes it fit belongs to whoever starts the
- * server (og-llama-cpp/serve.ts).
+ * The machine-level config layer. `stateDir` is configurable and holds the
+ * session database, but this path is not derived from it: the layering reads
+ * this file, so anything that writes a default here must write to the same
+ * place. They coincide by default, which is how a write to a moved `stateDir`
+ * managed to report success and then be ignored forever.
+ */
+export const MACHINE_CONFIG_FILE = path.join(HOME, ".og", "config.json");
+
+/**
+ * No models are shipped. og discovers them: from the endpoint, which is the only
+ * authority on what a request can reach, and from the models directory, which is
+ * what an operator sees themselves having. A table of names here could only be a
+ * guess about somebody else's machine — and a wrong guess is not inert, because a
+ * `llama-server` answers a request for a model it does not have with whatever it
+ * does have.
  *
- * None of them sets `temperature`: `agent.temperature` (0.2) governs, which is
- * what was actually in force before — tool-call JSON degrades at the 0.7 Qwen
- * recommends for chat.
+ * `model: ""` therefore means "nothing chosen yet". An entry appears in `models`
+ * only when an operator writes one, names one with `-m`, or `og models use` pins
+ * one; each carries the knobs og needs and nothing else does.
  */
 export const DEFAULT_CONFIG: OgConfig = {
 	endpoint: "http://127.0.0.1:8127",
-	model: "qwen3-coder-30b",
+	model: "",
 	stateDir: path.join(HOME, ".og"),
-	models: {
-		// Best quality/context balance measured on a 16 GiB card: 82.1 tok/s.
-		"qwen3-coder-30b": { contextWindow: 32768, ...QWEN_SAMPLING },
-		// Same weights, 64k window; pays ~15% throughput for 2x context.
-		"qwen3-coder-30b-long": { contextWindow: 65536, ...QWEN_SAMPLING },
-		// Q3 weights, ~1.7x faster (136.5 tok/s), measurably looser at structured output.
-		"qwen3-coder-30b-fast": { contextWindow: 32768, ...QWEN_SAMPLING },
-		// 24B dense: full offload leaves room for only 8k of q8_0 KV cache.
-		"devstral-24b": { contextWindow: 8192, topP: 0.95 },
-	},
+	modelsDir: process.env["OG_MODELS_DIR"] ?? path.join(HOME, "models"),
+	models: {},
 	agent: {
 		maxSteps: 60,
 		temperature: 0.2,
@@ -174,6 +172,10 @@ function envLayer(): Record<string, unknown> {
 	if (apiKey) layer["apiKey"] = apiKey;
 	const stateDir = process.env["OG_STATE_DIR"];
 	if (stateDir) layer["stateDir"] = stateDir;
+	// The same variable og-llama-cpp's installers and UI read, so pointing one at
+	// another disk points both.
+	const modelsDir = process.env["OG_MODELS_DIR"];
+	if (modelsDir) layer["modelsDir"] = modelsDir;
 	return layer;
 }
 
@@ -225,6 +227,9 @@ function validate(raw: Record<string, unknown>): OgConfig {
 	if (typeof raw["stateDir"] !== "string" || raw["stateDir"].length === 0) {
 		throw new ConfigError("invalid config: `stateDir` must be a non-empty path");
 	}
+	if (typeof raw["modelsDir"] !== "string" || raw["modelsDir"].length === 0) {
+		throw new ConfigError("invalid config: `modelsDir` must be a non-empty path");
+	}
 
 	// No emptiness check: layers merge rather than replace, so the shipped models
 	// always survive a user's `models` block and the record cannot be empty.
@@ -255,9 +260,14 @@ function validate(raw: Record<string, unknown>): OgConfig {
 	}
 
 	const model = raw["model"];
-	if (typeof model !== "string" || !Object.hasOwn(models, model)) {
+	// "" is the shipped state: nothing chosen, discover it. A *named* model still
+	// has to exist, so a typo in a config file fails here instead of being dialled.
+	if (typeof model !== "string") {
+		throw new ConfigError(`invalid config: \`model\` must be a string, got ${JSON.stringify(model)}`);
+	}
+	if (model !== "" && !Object.hasOwn(models, model)) {
 		throw new ConfigError(
-			`invalid config: \`model\` ${JSON.stringify(model)} is not a known model; available: ${Object.keys(models).join(", ")}`,
+			`invalid config: \`model\` ${JSON.stringify(model)} is not a known model; available: ${Object.keys(models).join(", ") || "(none configured)"}`,
 		);
 	}
 
@@ -296,7 +306,7 @@ export function loadConfig(opts: {
 	// Overrides are typed but structurally a record from the walker's point of view.
 	const overrides = opts.overrides as Record<string, unknown> | undefined;
 	const layers: (Record<string, unknown> | undefined)[] = [
-		readConfigFile(path.join(HOME, ".og", "config.json")),
+		readConfigFile(MACHINE_CONFIG_FILE),
 		readConfigFile(path.join(opts.workspaceRoot, ".og", "config.json")),
 		envLayer(),
 		overrides,
@@ -326,13 +336,59 @@ export function loadConfig(opts: {
 	return validate(merged);
 }
 
-/** Resolves a model spec by key, defaulting to the active `cfg.model`. */
+/**
+ * Whether a model was chosen by an operator rather than left to discovery. `-m`
+ * is the caller's to report; this reads the two layers it cannot see. A chosen
+ * name is honoured verbatim — a typo there should fail loudly rather than be
+ * quietly replaced.
+ */
+export function modelIsPinned(workspaceRoot: string, viaFlag = false): boolean {
+	if (viaFlag) return true;
+	const fromEnv = process.env["OG_MODEL"];
+	if (fromEnv !== undefined && fromEnv.length > 0) return true;
+	for (const file of [MACHINE_CONFIG_FILE, path.join(workspaceRoot, ".og", "config.json")]) {
+		const layer = readConfigFile(file);
+		const model = layer?.["model"];
+		if (typeof model === "string" && model.length > 0) return true;
+	}
+	return false;
+}
+
+/**
+ * The model og should talk to, discovered from what the endpoint is serving.
+ *
+ * A `llama-server` serves exactly what it loaded and answers to any name, so
+ * insisting on a name it does not have is not a harmless mismatch: og would
+ * receive the loaded model's output and budget its context from the wrong entry.
+ * Nothing is shipped to insist with, so when nobody pinned a model and the
+ * endpoint serves exactly one, that one is the answer — with the window the
+ * server itself reported, not a number carried here.
+ *
+ * Undefined means there is nothing to adopt: a model is pinned, the configured
+ * one is already being served, or the endpoint offers several and choosing
+ * between them is the operator's call.
+ */
+export function resolveActiveModel(cfg: OgConfig, served: readonly ServedModel[], pinned: boolean): ServedModel | undefined {
+	if (pinned || served.length !== 1) return undefined;
+	const only = served[0];
+	if (only === undefined) return undefined;
+	const current = cfg.model === "" ? "" : wireModelOf(cfg, cfg.model);
+	return only.id === current ? undefined : only;
+}
+
+/**
+ * Resolves a model spec by key, defaulting to the active one. `""` — nothing
+ * chosen yet — yields the fallback knobs rather than throwing, because a
+ * reachability probe has to be built before discovery can name anything. A *named*
+ * model that has no entry is still an error: that is a typo, not a discovery.
+ */
 export function modelSpecOf(cfg: OgConfig, key?: string): ModelSpec {
 	const wanted = key ?? cfg.model;
+	if (wanted === "") return { contextWindow: DEFAULT_CONTEXT_WINDOW };
 	const spec = cfg.models[wanted];
 	if (!spec) {
 		throw new ConfigError(
-			`unknown model "${wanted}"; available: ${Object.keys(cfg.models).join(", ") || "(none)"}`,
+			`unknown model "${wanted}"; available: ${Object.keys(cfg.models).join(", ") || "(none configured — og discovers what the endpoint serves)"}`,
 		);
 	}
 	return spec;

@@ -1,5 +1,6 @@
 import type { Agent } from "../agent/types.ts";
 import type { OgConfig } from "../config/schema.ts";
+import type { EndpointHealth } from "../provider/types.ts";
 import type { SessionStore } from "../session/types.ts";
 import type { ApprovalRequest } from "../tools/types.ts";
 
@@ -51,6 +52,14 @@ export interface UiDeps {
 	setApprovalHandler?(handler: ApprovalHandler | null): void;
 	/** Rebuilds provider+agent for a different model and/or session. */
 	rebuild?(req: RebuildRequest): Promise<RebuildResult>;
+	/**
+	 * Probes the active endpoint and reports which models it serves. Injected
+	 * rather than reached for: `provider/**` is the only code that opens a socket,
+	 * and a UI surface consumes results, never a provider. Absent for embedders,
+	 * in which case a listing says what is configured and claims nothing about
+	 * what is loaded.
+	 */
+	probeEndpoint?(): Promise<EndpointHealth>;
 }
 
 /** Result line emitted by headless JSON mode after the event stream. */

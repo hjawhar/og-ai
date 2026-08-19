@@ -79,6 +79,13 @@ export interface OgConfig {
 	tools: ToolsConfig;
 	/** Directory for sessions.db and logs. */
 	stateDir: string;
+	/**
+	 * Where weights live on this machine. og never loads one — it is a client and
+	 * starts no server — so this is read only to *show* what is here, next to what
+	 * the endpoint is actually serving. `OG_MODELS_DIR` is the same variable
+	 * og-llama-cpp's installers and UI use, so one setting moves both.
+	 */
+	modelsDir: string;
 }
 
 export class ConfigError extends Error {

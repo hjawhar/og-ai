@@ -752,15 +752,21 @@ describe("sampling from the active model spec", () => {
 		expect(req?.temperature).toBe(0);
 	});
 
-	test("the shipped default model sends the measured Qwen sampling", async () => {
-		const h = harness({ script: TEXT_TURN });
+	test("a discovered model carries no sampling of its own, so the agent block governs", async () => {
+		// og ships no model entries: a model adopted from the endpoint has only the
+		// window the server reported, and every sampling knob then comes from `agent`.
+		const h = harness({
+			script: TEXT_TURN,
+			patch: (cfg) => {
+				cfg.models["discovered"] = { id: "discovered", contextWindow: 8192 };
+				cfg.model = "discovered";
+			},
+		});
 		await drain(h.agent, "go");
 		const req = h.provider.requests[0];
-		// DEFAULT_CONFIG's active model sets no temperature, so the agent block wins.
 		expect(req?.temperature).toBe(DEFAULT_CONFIG.agent.temperature);
-		expect(req?.topP).toBe(0.8);
-		expect(req?.topK).toBe(20);
-		expect(req?.minP).toBe(0);
-		expect(req?.repeatPenalty).toBe(1.05);
+		expect(req?.topP).toBeUndefined();
+		expect(req?.topK).toBeUndefined();
+		expect(req?.repeatPenalty).toBeUndefined();
 	});
 });

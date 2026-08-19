@@ -68,6 +68,17 @@ export interface ChatRequest {
 	signal?: AbortSignal;
 }
 
+/** A model the endpoint says it is serving, and what it says about it. */
+export interface ServedModel {
+	id: string;
+	/**
+	 * Context length the server actually allocated, when it reports one.
+	 * llama.cpp puts it in `meta.n_ctx`. Discovering it is how og avoids carrying a
+	 * copied per-model number that can silently disagree with the running server.
+	 */
+	contextWindow?: number;
+}
+
 /** Outcome of an endpoint reachability probe. */
 export interface EndpointHealth {
 	/** True when the server answered at all — 401 and 404 are answers. */
@@ -76,10 +87,17 @@ export interface EndpointHealth {
 	status?: number;
 	/** Transport failure detail when nothing answered. */
 	detail?: string;
+	/**
+	 * Models the endpoint names. Absent when nothing answered or the body was not
+	 * a model list; empty when the server answered and named none, which for
+	 * llama.cpp means it is still loading weights. This is the only authority on
+	 * what can actually be used right now — a configured entry is knobs, not proof.
+	 */
+	models?: ServedModel[];
 }
 
 export interface ProviderInfo {
-	/** Model key from config, e.g. "qwen3-coder-30b". */
+	/** Model key from config, or the served id og discovered. */
 	id: string;
 	/** Model identifier sent to the backend. */
 	model: string;

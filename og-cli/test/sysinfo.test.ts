@@ -243,16 +243,18 @@ describe("collectSystemInfo", () => {
 	}, 20_000);
 
 	test("the endpoint block is read from config, with no network at all", async () => {
-		// A port nothing is listening on: collection must not care.
+		// A port nothing is listening on: collection must not care. The entry is
+		// declared here because og ships none — it discovers them.
 		const config: OgConfig = {
 			...DEFAULT_CONFIG,
 			endpoint: "http://127.0.0.1:1",
-			model: "qwen3-coder-30b-long",
+			model: "local-model",
+			models: { "local-model": { contextWindow: 65536 } },
 		};
 		const info = await collectSystemInfo(config);
 		expect(info.endpoint).toEqual({
 			url: "http://127.0.0.1:1",
-			model: "qwen3-coder-30b-long",
+			model: "local-model",
 			contextWindow: 65536,
 		});
 	}, 20_000);

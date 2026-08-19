@@ -10,6 +10,7 @@ import type {
 	FinishReason,
 	Message,
 	Provider,
+	ServedModel,
 	StreamEvent,
 	ToolCall,
 	ToolSpec,
@@ -349,15 +350,65 @@ export class OpenAIProvider implements Provider {
 	 * because every OpenAI-compatible server exposes it, llama.cpp included; a
 	 * second route would add nothing, since a transport failure fails per host
 	 * rather than per path.
+	 *
+	 * The body is read as well as the status, because that list is the only
+	 * authority on which model a request will actually reach: llama.cpp serves
+	 * whatever it loaded regardless of the name asked for, so a configured name
+	 * that is not in here is a name og would be sending into a fiction.
 	 */
 	async health(): Promise<EndpointHealth> {
 		try {
 			const res = await fetch(`${this.endpoint}/v1/models`, { headers: this.headers() });
-			return { reachable: true, status: res.status };
+			const health: EndpointHealth = { reachable: true, status: res.status };
+			const served = await servedModels(res);
+			if (served !== undefined) health.models = served;
+			return health;
 		} catch (err) {
 			return { reachable: false, detail: err instanceof Error ? err.message : String(err) };
 		}
 	}
+}
+
+/**
+ * `{ data: [{ id, meta: { n_ctx } }] }` — the OpenAI list-models shape, plus the
+ * `meta` llama.cpp adds. Undefined rather than empty when the body is unreadable
+ * or shaped differently, because "answered with something else" and "answered
+ * naming no model" mean different things to a caller: only the second one says
+ * the server is still loading.
+ *
+ * `n_ctx` is read because it is the context length the server *actually*
+ * allocated. Taking it from here rather than from a number og carries is what
+ * stops the two disagreeing silently.
+ */
+async function servedModels(res: Response): Promise<ServedModel[] | undefined> {
+	if (!res.ok) return undefined;
+	let body: unknown;
+	try {
+		body = await res.json();
+	} catch {
+		return undefined;
+	}
+	if (typeof body !== "object" || body === null || !("data" in body)) return undefined;
+	const data = (body as { data: unknown }).data;
+	if (!Array.isArray(data)) return undefined;
+	const models: ServedModel[] = [];
+	for (const entry of data) {
+		if (typeof entry !== "object" || entry === null || !("id" in entry)) continue;
+		const id = (entry as { id: unknown }).id;
+		if (typeof id !== "string" || id.length === 0) continue;
+		const window = contextWindowOf(entry);
+		models.push(window === undefined ? { id } : { id, contextWindow: window });
+	}
+	return models;
+}
+
+/** `meta.n_ctx` when the server reports it, ignoring anything that is not a positive integer. */
+function contextWindowOf(entry: object): number | undefined {
+	if (!("meta" in entry)) return undefined;
+	const meta = (entry as { meta: unknown }).meta;
+	if (typeof meta !== "object" || meta === null || !("n_ctx" in meta)) return undefined;
+	const raw = (meta as { n_ctx: unknown }).n_ctx;
+	return typeof raw === "number" && Number.isInteger(raw) && raw > 0 ? raw : undefined;
 }
 
 function specToWire(spec: ToolSpec): Record<string, unknown> {

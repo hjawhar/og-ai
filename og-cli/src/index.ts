@@ -12,13 +12,17 @@ import manifest from "../package.json" with { type: "json" };
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import type { Agent } from "./agent/types.ts";
+import { DEFAULT_CONTEXT_WINDOW, MACHINE_CONFIG_FILE, modelIsPinned, resolveActiveModel } from "./config/load.ts";
 import { ConfigError, type OgConfig } from "./config/schema.ts";
 import type { ApprovalRequest } from "./tools/types.ts";
-import { bold, cyan, decideApproval, dim, formatError, green, red } from "./ui/render.ts";
+import { installedWeights } from "./util/weights.ts";
+import { bold, cyan, decideApproval, dim, formatError, formatModels, red } from "./ui/render.ts";
 import { EXIT_ERROR, EXIT_OK, type ApprovalHandler, type RebuildRequest, type RebuildResult, type UiDeps } from "./ui/types.ts";
 
 interface Flags {
 	json: boolean;
+	/** `og models --all`: print configured entries the endpoint is not serving. */
+	all: boolean;
 	print: boolean;
 	promptParts: string[];
 	continueLatest: boolean;
@@ -53,6 +57,7 @@ const COMPLETION_SHELLS = ["powershell", "bash"] as const;
 function parseArgs(argv: readonly string[]): ParsedArgs {
 	const flags: Flags = {
 		json: false,
+		all: false,
 		print: false,
 		promptParts: [],
 		continueLatest: false,
@@ -87,6 +92,9 @@ function parseArgs(argv: readonly string[]): ParsedArgs {
 					break;
 				case "version":
 					version = true;
+					break;
+				case "all":
+					flags.all = true;
 					break;
 				case "json":
 					flags.json = true;
@@ -235,8 +243,8 @@ ${bold("usage")}
   og [options] [prompt...]              interactive REPL, or one-shot when a prompt is given
   og -p "fix the failing test"          headless run, assistant text on stdout
   og sessions list|show <id>|rm <id>    inspect stored sessions
-  og models [list]                      list configured models with endpoint and window
-  og models use <key>                   set the default model
+  og models [list] [--all]              what the endpoint serves; --all adds the rest of the record
+  og models use <name>                  set the default model
   og completion powershell|bash         print a shell completion script
 
 ${bold("options")}
@@ -321,40 +329,59 @@ async function main(): Promise<number> {
 	});
 
 	if (command.kind === "models") {
+		// The endpoint is asked in both branches: it is the only authority on which
+		// models exist, and `use` must accept one it serves even when no entry
+		// describes it.
+		const { createProvider } = await import("./provider/registry.ts");
+		const probe = createProvider(config);
+		const health = await probe.health();
+		const served = health.models ?? [];
+		// The same adoption a run performs, so the listing marks the model a request
+		// would really carry rather than the placeholder it was configured with.
+		const adopted = resolveActiveModel(config, served, modelIsPinned(workspaceRoot, overrides.model !== undefined));
+
 		if (command.action === "use") {
-			if (config.models[command.key] === undefined) {
-				throw new ConfigError(`unknown model "${command.key}"; available: ${Object.keys(config.models).join(", ")}`);
+			const configured = config.models[command.key] !== undefined;
+			let pinnedWindow: number | undefined;
+			if (!configured && !served.some((model) => model.id === command.key)) {
+				const known = [...new Set([...served.map((model) => model.id), ...Object.keys(config.models)])].join(", ");
+				throw new ConfigError(`unknown model "${command.key}"; available: ${known || "(none — nothing is being served and nothing is configured)"}`);
 			}
-			// Persisted at machine level so every workspace picks it up; a workspace
-			// `.og/config.json` still wins, which is the documented layering.
-			const file = join(config.stateDir, "config.json");
+			// The machine layer, so every workspace picks it up; a workspace
+			// `.og/config.json` still wins, which is the documented layering. Not
+			// `stateDir`: that is configurable and is not what loadConfig reads.
+			const file = MACHINE_CONFIG_FILE;
 			let existing: Record<string, unknown> = {};
 			if (existsSync(file)) {
 				const parsed: unknown = JSON.parse(readFileSync(file, "utf8").replace(/^\uFEFF/, ""));
 				if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) existing = parsed as Record<string, unknown>;
 			}
 			existing["model"] = command.key;
-			mkdirSync(config.stateDir, { recursive: true });
+			if (!configured) {
+				// A bare name in a config file fails validation on the next run, so the
+				// entry is written with it. The window is the one the endpoint reported
+				// serving, which is the whole point of asking it.
+				const window = served.find((model) => model.id === command.key)?.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
+				const models = typeof existing["models"] === "object" && existing["models"] !== null && !Array.isArray(existing["models"]) ? (existing["models"] as Record<string, unknown>) : {};
+				models[command.key] = { contextWindow: window };
+				existing["models"] = models;
+				pinnedWindow = window;
+			}
+			mkdirSync(dirname(file), { recursive: true });
 			writeFileSync(file, `${JSON.stringify(existing, null, 2)}\n`, "utf8");
 			out.write(`default model \u2192 ${bold(command.key)} ${dim(`(written to ${file})`)}\n`);
+			if (pinnedWindow !== undefined) {
+				const source = served.some((model) => model.id === command.key && model.contextWindow !== undefined) ? "as the endpoint reports serving it" : "og's fallback — the endpoint did not say";
+				out.write(`${dim(`  window ${pinnedWindow} (${source})\n`)}`);
+			}
 			return EXIT_OK;
 		}
 
-		for (const [key, spec] of Object.entries(config.models)) {
-			const mark = key === config.model ? green("*") : " ";
-			const knobs = [`window ${spec.contextWindow}`];
-			if (spec.maxTokens !== undefined) knobs.push(`max-tokens ${spec.maxTokens}`);
-			if (spec.temperature !== undefined) knobs.push(`temp ${spec.temperature}`);
-			if (spec.topP !== undefined) knobs.push(`top-p ${spec.topP}`);
-			if (spec.topK !== undefined) knobs.push(`top-k ${spec.topK}`);
-			if (spec.minP !== undefined) knobs.push(`min-p ${spec.minP}`);
-			if (spec.repeatPenalty !== undefined) knobs.push(`repeat-penalty ${spec.repeatPenalty}`);
-			// The variable name, never its value: og prints config, not secrets.
-			if (spec.apiKeyEnv !== undefined) knobs.push(`key from $${spec.apiKeyEnv}`);
-			out.write(`${mark} ${bold(key.padEnd(22))} ${dim(`${spec.id ?? key} @ ${spec.endpoint ?? config.endpoint}`)}\n`);
-			out.write(`  ${dim(knobs.join(" \u00b7 "))}\n`);
+		out.write(formatModels({ config, health, endpoint: probe.endpoint, active: adopted?.id ?? config.model, installed: installedWeights(config.modelsDir), all: flags.all }));
+		if (adopted !== undefined) {
+			out.write(`${dim(`og follows the endpoint while no model is pinned — og models use ${adopted.id} to fix it in place\n`)}`);
 		}
-		out.write(`${dim("og models use <key> sets the default; -m <name> accepts any model the endpoint serves")}\n`);
+		out.write(`${dim("og models --all lists the rest; og models use <name> sets the default; -m <name> uses one once. Both accept any model the endpoint serves.")}\n`);
 		return EXIT_OK;
 	}
 
@@ -411,6 +438,32 @@ async function main(): Promise<number> {
 			);
 		}
 
+		// Nothing is shipped to fall back on, so the model is discovered: a
+		// `llama-server` answers to any name with whatever it loaded, and its own
+		// `/v1/models` is the only place the truth lives. An explicit `-m`, `OG_MODEL`
+		// or config `model` is never overridden.
+		const adopted = resolveActiveModel(config, health.models ?? [], modelIsPinned(workspaceRoot, overrides.model !== undefined));
+		if (adopted !== undefined) {
+			// The window the server reported beats the fallback, and `--context-window`
+			// beats both, because that is an operator overriding a measurement.
+			const window = flags.contextWindow ?? adopted.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
+			config.models[adopted.id] = { id: adopted.id, contextWindow: window };
+			config.model = adopted.id;
+			provider = createProvider(config);
+		}
+		if (config.model === "") {
+			const names = (health.models ?? []).map((model) => model.id);
+			const onDisk = installedWeights(config.modelsDir);
+			throw new ConfigError(
+				names.length > 1
+					? `${provider.endpoint} serves ${names.length} models (${names.join(", ")}) and none is pinned — choose one with -m <name> or \`og models use <name>\`.`
+					: `${provider.endpoint} is not serving a model, and og starts no server. ` +
+							(onDisk.length === 0
+								? `Nothing in ${config.modelsDir} either — download weights with og-llama-cpp's model UI.`
+								: `Load one of the ${onDisk.length} in ${config.modelsDir} with og-llama-cpp's \`bun run serve.ts\` or its model UI.`),
+			);
+		}
+
 		let approvalHandler: ApprovalHandler | null = null;
 		const approve = (req: ApprovalRequest): Promise<boolean> => (approvalHandler === null ? Promise.resolve(decideApproval(config, req)) : approvalHandler(req));
 
@@ -430,7 +483,12 @@ async function main(): Promise<number> {
 
 		const rebuild = async (req: RebuildRequest): Promise<RebuildResult> => {
 			if (req.model !== undefined && req.model !== config.model) {
-				if (config.models[req.model] === undefined) throw new ConfigError(`unknown model "${req.model}"`);
+				if (config.models[req.model] === undefined) {
+					// Same pass `-m <name>` gets in loadConfig: a name the operator asked
+					// for explicitly is not a typo to reject, and any OpenAI-compatible
+					// server names its own models. og's default window until told better.
+					config.models[req.model] = { id: req.model, contextWindow: DEFAULT_CONTEXT_WINDOW };
+				}
 				config.model = req.model;
 				provider = createProvider(config);
 			}
@@ -464,6 +522,9 @@ async function main(): Promise<number> {
 				approvalHandler = handler;
 			},
 			rebuild,
+			// `provider` is reassigned by `rebuild`, so the probe reads it at call time
+			// and follows a model switch to its endpoint.
+			probeEndpoint: () => provider.health(),
 			...(flags.maxSteps === undefined ? {} : { maxSteps: flags.maxSteps }),
 		};
 

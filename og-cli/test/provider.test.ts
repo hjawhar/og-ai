@@ -497,18 +497,47 @@ describe("outgoing request payload", () => {
 });
 
 describe("health", () => {
-	test("one GET to /v1/models is the whole probe", async () => {
+	test("one GET to /v1/models is the whole probe, and its body names the served models", async () => {
 		const routes: string[] = [];
 		const endpoint = serve((req) => {
 			routes.push(`${req.method} ${new URL(req.url).pathname}`);
-			return Response.json({ data: [{ id: "test-model" }] });
+			// `meta.n_ctx` is what llama.cpp reports; a gateway that omits it is the
+			// second entry.
+			return Response.json({ data: [{ id: "test-model", meta: { n_ctx: 8192 } }, { id: "other-model" }] });
 		});
 
-		expect(await provider(endpoint).health()).toEqual({ reachable: true, status: 200 });
+		// The ids matter as much as the status: llama.cpp answers a request with
+		// whatever it loaded regardless of the name asked for, so this list is the
+		// only proof of which model a request would actually reach — and `n_ctx` is
+		// the window it actually allocated, which og would otherwise have to guess.
+		expect(await provider(endpoint).health()).toEqual({
+			reachable: true,
+			status: 200,
+			models: [{ id: "test-model", contextWindow: 8192 }, { id: "other-model" }],
+		});
 		// Exactly one request: every OpenAI-compatible server exposes this route,
 		// and a second probe could not tell reachability apart from the first,
 		// because a transport failure fails per host rather than per path.
 		expect(routes).toEqual(["GET /v1/models"]);
+	});
+
+	test("a nonsense n_ctx is ignored rather than believed", async () => {
+		const endpoint = serve(() => Response.json({ data: [{ id: "m", meta: { n_ctx: -1 } }, { id: "n", meta: { n_ctx: "lots" } }] }));
+		expect((await provider(endpoint).health()).models).toEqual([{ id: "m" }, { id: "n" }]);
+	});
+
+	test("an answer that is not a model list leaves the served set unknown, not empty", async () => {
+		// Absent and empty mean different things downstream: empty says the server
+		// named nothing, which for llama.cpp means it is still loading.
+		const endpoint = serve(() => Response.json({ object: "list" }));
+		const health = await provider(endpoint).health();
+		expect(health.reachable).toBe(true);
+		expect(health.models).toBeUndefined();
+	});
+
+	test("a served list with no usable ids is empty rather than absent", async () => {
+		const endpoint = serve(() => Response.json({ data: [] }));
+		expect((await provider(endpoint).health()).models).toEqual([]);
 	});
 
 	test("a 404 model list is still an answer: something is listening", async () => {
@@ -520,6 +549,7 @@ describe("health", () => {
 			routes.push(new URL(req.url).pathname);
 			return new Response("nope", { status: 404 });
 		});
+		// A non-2xx body is not a model list, so nothing is claimed about what is served.
 		expect(await provider(endpoint).health()).toEqual({ reachable: true, status: 404 });
 		expect(routes).toEqual(["/v1/models"]);
 	});

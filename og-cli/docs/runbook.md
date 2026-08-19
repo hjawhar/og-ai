@@ -19,22 +19,43 @@ PowerShell recipes are from that install. From a source checkout, substitute
 
 ## 1. Is the endpoint up?
 
-Two questions, and they are separate. **What is configured** is a local question `og` answers
-offline; **what is answering** is an HTTP question.
+Two questions, and `og models` answers both in one table, because either alone misleads: **what is
+configured** is knobs `og` holds locally, **what is loaded** is only the endpoint's to say.
 
 ```console
 $ og models
-* qwen3-coder-30b        qwen3-coder-30b @ http://127.0.0.1:8127
-  window 32768 · top-p 0.8 · top-k 20 · min-p 0 · repeat-penalty 1.05
-  gpt-4o                 gpt-4o @ https://api.openai.com
-  window 128000 · temp 0.2 · key from $OPENAI_API_KEY
-og models use <key> sets the default; -m <name> accepts any model the endpoint serves
+* Laguna-XS-2.1-APEX-I-Mini  serving now
+                             window 32768 (og's default — no entry configured for it)
+  4 more configured and not being served
+og follows the endpoint while no model is pinned — og models use Laguna-XS-2.1-APEX-I-Mini to fix it in place
 ```
 
-`og models` opens no socket. It exits **0** with nothing listening anywhere, which is exactly what
-makes it the first command to run: it tells you the wire model id, the effective endpoint after
-per-model overrides, and which environment variable a key would come from — the three things
-people get wrong. A key's *value* is never printed, only its variable name.
+**Nothing pinned means og follows the endpoint.** With no `-m`, no `OG_MODEL` and no `model` in
+either config file there is nothing to fall back on — og ships no model entries at all — and a
+`llama-server` would answer a request for any name with whatever it actually loaded: the loaded
+model's output, budgeted from the wrong entry, with nothing in either log saying so. So when exactly
+one model is served and nothing is pinned, that one is active, with the context window the server
+itself reported. Pin it and og obeys you instead, wrong or not: a typo in a config file should fail
+loudly. Two models served with nothing pinned is an error naming both, because choosing between them
+is not og's call.
+
+The rows are what is **usable**: what the endpoint serves, plus the active entry. The rest of the
+record is counted, and `og models --all` prints it — og's own four entries marked `shipped preset`
+(measured windows and sampling recipes, not weights anyone has), and entries aimed at another host
+tagged `other endpoint <url>` rather than judged, because this probe says nothing about that host.
+`og` cannot list *installed* weights and must not learn how: it never starts a server, so a `.gguf` on
+disk is not a fact it can act on. That inventory is `og-llama-cpp`'s, and its UI shows it.
+
+It runs one `GET {endpoint}/v1/models` and nothing else, and it still exits **0** with nothing
+listening anywhere — which is what keeps it the first command to run. Offline it names the active
+entry and says nothing answered; it does not claim a model is `not loaded` when no answer proved it.
+It tells you the wire model id, the effective endpoint after per-model overrides, and which
+environment variable a key would come from — the three things people get wrong. A key's *value* is
+never printed, only its variable name.
+
+The tags matter more than they look. llama.cpp answers a request with whatever weights it loaded no
+matter which name was asked for, so a default that is `not loaded` does not fail: it silently
+returns another model's output, budgeted with the wrong context window.
 
 Then ask the endpoint itself. `og`'s own probe hits `GET {endpoint}/v1/models` first and falls back
 to `GET {endpoint}/health`, so those are the two URLs worth curling by hand:
@@ -92,7 +113,7 @@ all read identically. The message tells you the endpoint `og` dialled, not why t
 it there:
 
 ```sh
-cd ../og-llama-cpp && bun run serve.ts --profile qwen3-coder-30b
+cd ../og-llama-cpp && bun run serve.ts --profile your-model
 ```
 
 That process is the server's whole lifetime: it runs in the foreground with llama.cpp's log on your
@@ -120,7 +141,7 @@ whichever terminal is running the server.
 
 ```console
 $ og sessions list
-d5a1d59d-c6fc-41e2-b0c5-7db7dd9e2033 2026-08-19 14:02 · qwen3-coder-30b · 5158 tok · /home/you/demo
+d5a1d59d-c6fc-41e2-b0c5-7db7dd9e2033 2026-08-19 14:02 · your-model · 5158 tok · /home/you/demo
   add peek() to LruCache
 ```
 
@@ -146,8 +167,8 @@ report per-model throughput without mixing two models.
 
 ```sh
 og models                            # what is configured, and where each entry's requests go
-og models use qwen3-coder-30b-fast   # persist the default to ~/.og/config.json
-og -m qwen3-coder-30b-fast -p "..."  # one run only
+og models use your-model   # persist the default to ~/.og/config.json
+og -m your-model -p "..."  # one run only
 og -m gpt-4o --endpoint https://api.openai.com --context-window 128000 -p "..."
 ```
 
@@ -163,16 +184,21 @@ Two things to know:
   rejection, not an `og` failure; restart the server with the other profile (§1) if you actually
   want different weights. There is no preflight on a switch either, so a switch to an unreachable
   backend surfaces at the first request rather than at the switch.
-- **`og models use` writes only the `model` key**, and machine config is the *second* layer: a
-  `<workspace>/.og/config.json` with its own `model` still wins. If a `use` appears to do nothing,
-  check for a workspace override first.
+- **`og models use` writes the `model` key**, plus a `models.<name>` entry when the name had none —
+  a bare name in a config file fails validation on the next run, so the entry is written with it at
+  og's default window. Machine config is the *second* layer: a `<workspace>/.og/config.json` with
+  its own `model` still wins. If a `use` appears to do nothing, check for a workspace override
+  first. It writes `~/.og/config.json` specifically, which is the file the layering reads — not
+  `stateDir`, even when that has been moved.
 
 `-m` accepts any name, registered or not: an unknown one is synthesised as
 `{ id: <name>, contextWindow: 32768 }`, overridable with `--context-window`. That is the fast path
 for "does this gateway's model work at all?" without editing config. The same is true of `OG_MODEL`.
 A `model` in a **config file** gets no such pass — an unknown one there fails with
 `unknown model "..."; available: ...`, which is what catches a typo you would otherwise chase into
-the server's logs. `og models use <key>` validates against `config.models` for the same reason.
+the server's logs. `og models use <name>` takes the same view from the other side: it accepts a name
+the endpoint is currently serving even with no entry configured, and refuses one that is neither
+configured nor served.
 
 ## 4. Shell completion
 
@@ -241,15 +267,19 @@ llama.cpp's `model not found` or OpenAI's `The model \`...\` does not exist`.
 `og` sends `spec.id ?? <record key>` verbatim and never rewrites it. So:
 
 ```sh
-og models                                                # what id would be sent, and to where
-curl -sS http://127.0.0.1:8127/v1/models                 # what the server admits to serving
+og models                                                # both sides at once: served vs configured
+curl -sS http://127.0.0.1:8127/v1/models                 # the same list, unmediated
 ```
+
+`og models` marks the mismatch itself — the served entry reads `serving now`, yours reads
+`not loaded`, and a warning names the fix — so the `curl` is a second opinion rather than the
+diagnosis.
 
 - A `llama-server` serves exactly one model, under its `--alias` (which `serve.ts` defaults
   to the profile key). Either match your entry's `id` to that alias, or restart the server with the
   alias you want.
 - On a gateway the id is usually namespaced (`anthropic/claude-sonnet-4`,
-  `qwen/qwen3-coder-30b-instruct`). Set `id` on the entry and keep the record key short; the key is
+  `qwen/your-model-instruct`). Set `id` on the entry and keep the record key short; the key is
   only what you type.
 - One config can address several endpoints at once — an entry's own `endpoint` beats the top-level
   one — so "wrong model" and "right model, wrong endpoint" look identical until you read
@@ -410,7 +440,7 @@ Signs you need more room: frequent `compaction` events, or `/context` in the TUI
 results dominating the window.
 
 - Use an entry with a larger window against a server actually started with that much `-c`
-  (`qwen3-coder-30b-long` is 65536) rather than raising `contextWindow` past what the server
+  (`your-other-model` is 65536) rather than raising `contextWindow` past what the server
   serves — see *Context window mismatch* above.
 - Lower `tools.maxOutputBytes` (default 65536) if giant `bash`/`grep` results are eating the
   window.
@@ -457,10 +487,11 @@ it, bumping its build, rolling one back and building it by hand all live in the 
 | VRAM and throughput per operating point, measured; the spill cliff and its fix ladder | `../../og-llama-cpp/docs/benchmarks.md` |
 | `llama-server` flag names for the pinned build | `../../og-llama-cpp/serve.ts` — the only place in the repository that builds that argv |
 
-One thing stays this project's problem after a server-side change: **`contextWindow`**. It is the
-only server-side number `og` carries, it is copied from the measurement record, and nothing
-validates it against the running server (§5, *Context window mismatch*). If an upgrade or a
-re-measurement moves an operating point's `-c`, update the entry in `src/config/load.ts` to match.
+Nothing stays this project's problem after a server-side change. **`contextWindow` is discovered**:
+og reads `meta.n_ctx` from `GET /v1/models` and budgets against the window the server actually
+allocated, so a re-measurement that moves an operating point's `-c` needs no edit here. A window
+written into a config entry still wins for that entry — `og models` prints both when they disagree
+(`window 8192 (as served) · configured 32768`), which is the one case worth reading.
 
 The client-side smoke test after any server change is two commands, run with the server up:
 

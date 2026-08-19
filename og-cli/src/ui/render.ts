@@ -4,7 +4,9 @@
  * same inputs (plus the toggle) always produce the same string.
  */
 
-import type { OgConfig, ApprovalPolicy } from "../config/schema.ts";
+import { DEFAULT_CONTEXT_WINDOW } from "../config/load.ts";
+import type { OgConfig, ApprovalPolicy, ModelSpec } from "../config/schema.ts";
+import type { EndpointHealth } from "../provider/types.ts";
 import type { ApprovalRequest } from "../tools/types.ts";
 
 const ESC = "\u001b[";
@@ -287,4 +289,139 @@ export function decideApproval(config: OgConfig, req: ApprovalRequest): boolean 
 	if (policy === "never") return true;
 	if (policy === "always") return false;
 	return req.risk !== "exec";
+}
+
+/** Everything the `og models` table draws from. Named because it reached six arguments. */
+export interface ModelsView {
+	config: OgConfig;
+	health: EndpointHealth;
+	/** Endpoint the health probe actually asked. */
+	endpoint: string;
+	/** Model a request would carry right now; `""` when nothing has been discovered. */
+	active: string;
+	/** `.gguf` filenames in the models directory. Shown, never acted on. */
+	installed?: readonly string[];
+	/** Print configured entries the endpoint is not serving. */
+	all?: boolean;
+}
+
+/**
+ * The `og models` table: three kinds of row, because each answers a question the
+ * other two cannot.
+ *
+ * **serving now** — from the endpoint, the only authority on what a request will
+ * actually reach, with the context window the server itself reported. llama.cpp
+ * answers to any name with whatever it loaded, so this is the row that cannot be
+ * wrong.
+ *
+ * **on disk** — `.gguf` files in the models directory. og cannot load one; it
+ * starts no server. They are listed because leaving them out was worse: someone
+ * who had just downloaded three models saw names they had never chosen and
+ * reasonably concluded og was lying to them.
+ *
+ * **configured** — knobs an operator wrote: a context window, sampling, a key
+ * variable. Nothing is shipped here, so any row of this kind is theirs. Entries
+ * beyond the active one are counted rather than printed unless `all`.
+ */
+export function formatModels(view: ModelsView): string {
+	const { config, health, endpoint, active } = view;
+	const served = health.models ?? [];
+	const all = view.all === true;
+	const lines: string[] = [];
+
+	const keyFor = (id: string): string | undefined =>
+		Object.keys(config.models).find((key) => (config.models[key]?.id ?? key) === id);
+
+	const rows: { name: string; spec?: ModelSpec; window?: number; tag: string }[] = [];
+	for (const model of served) {
+		const key = keyFor(model.id);
+		const spec = key === undefined ? undefined : config.models[key];
+		rows.push({
+			name: key ?? model.id,
+			...(spec === undefined ? {} : { spec }),
+			...(model.contextWindow === undefined ? {} : { window: model.contextWindow }),
+			tag: green("serving now"),
+		});
+	}
+
+	// Files present but not loaded. Matched by the alias convention serve.ts uses —
+	// the filename without `.gguf` — so the running model is not listed twice.
+	for (const file of view.installed ?? []) {
+		const name = file.replace(/\.gguf$/i, "");
+		if (served.some((model) => model.id === name)) continue;
+		const spec = config.models[name];
+		rows.push({ name, ...(spec === undefined ? {} : { spec }), tag: cyan("on disk, not loaded") });
+	}
+
+	let hidden = 0;
+	for (const [key, spec] of Object.entries(config.models)) {
+		if (served.some((model) => model.id === (spec.id ?? key))) continue;
+		if (rows.some((row) => row.name === key)) continue;
+		if (!all && key !== active) {
+			hidden++;
+			continue;
+		}
+		const own = spec.endpoint ?? config.endpoint;
+		// Nothing answered means nothing is known: "not loaded" would be a claim this
+		// probe cannot make.
+		rows.push({ name: key, spec, tag: own !== endpoint ? dim(`other endpoint ${own}`) : health.reachable ? dim("not loaded") : "" });
+	}
+
+	const width = Math.max(...rows.map((row) => row.name.length), 10);
+	for (const row of rows) {
+		const mark = row.name === active ? green("*") : " ";
+		lines.push(`${mark} ${bold(row.name.padEnd(width))}${row.tag === "" ? "" : `  ${row.tag}`}`);
+		lines.push(`  ${" ".repeat(width)}  ${dim(knobsOf(row.spec, row.window))}`);
+	}
+	if (hidden > 0) {
+		// No command named here: this block is printed by both the CLI and the REPL,
+		// and each spells its own ("og models --all" / "/models all") in its footer.
+		lines.push(dim(`  ${hidden} more configured and not being served`));
+	}
+
+	if (!health.reachable) {
+		lines.unshift(`${formatWarn(`nothing answered at ${endpoint}`)}${health.detail === undefined ? "" : dim(` — ${health.detail}`)}`);
+		lines.push(dim("  og starts no server: run one with og-llama-cpp's `bun run serve.ts`, or its model UI."));
+	} else if (served.length === 0) {
+		lines.unshift(formatWarn(`${endpoint} answered but named no model — it is still loading, or nothing is loaded`));
+	} else if (active !== "" && !served.some((model) => model.id === wireOf(config, active))) {
+		// The failure this whole listing exists to surface: og sends a name the
+		// endpoint does not have, gets the loaded model's answer anyway, and sizes
+		// its context from the wrong entry.
+		const first = served[0]?.id ?? "";
+		lines.push("");
+		lines.push(formatWarn(`the active model ${bold(active)} is not what ${endpoint} is serving`));
+		lines.push(dim(`  og models use ${first}   sets it; og -m ${first} uses it once`));
+	}
+	return `${lines.join("\n")}\n`;
+}
+
+function wireOf(config: OgConfig, key: string): string {
+	return config.models[key]?.id ?? key;
+}
+
+/**
+ * Knobs og will apply. `served` is the window the endpoint said it allocated: it
+ * wins over a configured number and is labelled, because the two disagreeing is
+ * the failure that makes a server truncate a prompt silently. With neither, the
+ * fallback is named as a fallback rather than presented as a fact.
+ */
+function knobsOf(spec: ModelSpec | undefined, served?: number): string {
+	const knobs: string[] = [];
+	if (served !== undefined) knobs.push(`window ${served} (as served)`);
+	else if (spec !== undefined) knobs.push(`window ${spec.contextWindow}`);
+	else knobs.push(`window ${DEFAULT_CONTEXT_WINDOW} (og's fallback — the endpoint did not say)`);
+	if (served !== undefined && spec !== undefined && spec.contextWindow !== served) {
+		knobs.push(`configured ${spec.contextWindow}`);
+	}
+	if (spec === undefined) return knobs.join(" \u00b7 ");
+	if (spec.maxTokens !== undefined) knobs.push(`max-tokens ${spec.maxTokens}`);
+	if (spec.temperature !== undefined) knobs.push(`temp ${spec.temperature}`);
+	if (spec.topP !== undefined) knobs.push(`top-p ${spec.topP}`);
+	if (spec.topK !== undefined) knobs.push(`top-k ${spec.topK}`);
+	if (spec.minP !== undefined) knobs.push(`min-p ${spec.minP}`);
+	if (spec.repeatPenalty !== undefined) knobs.push(`repeat-penalty ${spec.repeatPenalty}`);
+	// The variable name, never its value: og prints config, not secrets.
+	if (spec.apiKeyEnv !== undefined) knobs.push(`key from $${spec.apiKeyEnv}`);
+	return knobs.join(" \u00b7 ");
 }

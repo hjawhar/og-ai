@@ -6,6 +6,7 @@ import { estimateTokens, messageTokens } from "../agent/context.ts";
 import type { Agent, AgentRunOptions } from "../agent/types.ts";
 import { endpointOf, modelSpecOf, wireModelOf } from "../config/load.ts";
 import type { ModelSpec } from "../config/schema.ts";
+import { installedWeights } from "../util/weights.ts";
 import type { Role } from "../provider/types.ts";
 import type { ApprovalRequest } from "../tools/types.ts";
 import { type BarState, collapseHome, renderBar, renderPrompt } from "./chrome.ts";
@@ -18,6 +19,7 @@ import {
 	formatContext,
 	formatDiffish,
 	formatError,
+	formatModels,
 	formatTokenCount,
 	formatTokensPerSec,
 	formatToolEnd,
@@ -528,22 +530,27 @@ export async function runTui(deps: UiDeps): Promise<number> {
 				const target = subRest.join(" ").trim();
 				const action = sub.toLowerCase();
 
-				// `/models` and `/models list` both list; `/model <key>` stays valid
-				// because it is the shape people type from muscle memory.
-				if (action === "" || action === "list") {
-					// Same two-line shape and the same words as `og models`, so the
-					// REPL and the CLI never describe one model two ways.
-					for (const [key, spec] of Object.entries(config.models)) {
-						const mark = key === modelKey ? green("*") : " ";
-						const facts = [`window ${spec.contextWindow}`];
-						if (spec.maxTokens !== undefined) facts.push(`max-tokens ${spec.maxTokens}`);
-						facts.push(...samplingKnobs(spec));
-						// The variable name, never its value: og prints config, not secrets.
-						if (spec.apiKeyEnv !== undefined) facts.push(`key from $${spec.apiKeyEnv}`);
-						live.line(`${mark} ${bold(key.padEnd(22))} ${dim(`${spec.id ?? key} @ ${spec.endpoint ?? config.endpoint}`)}`);
-						live.line(`  ${dim(facts.join(" \u00b7 "))}`);
-					}
-					live.line(dim("/models switch <key> changes model; /models info <key> shows everything"));
+				// `/models` and `/models list` both list; `/models all` adds the entries
+				// the endpoint is not serving; `/model <key>` stays valid because it is
+				// the shape people type from muscle memory.
+				if (action === "" || action === "list" || action === "all") {
+					// The same function `og models` uses, so the REPL and the CLI never
+					// describe one model two ways — including which of them the endpoint
+					// is actually serving, which is the difference between a switch that
+					// works and one that silently answers from other weights.
+					const health = deps.probeEndpoint === undefined ? { reachable: false } : await deps.probeEndpoint();
+					// Line by line like every other multi-line block here: `live.text`
+					// collapses a blank line and eats leading indentation.
+					const block = formatModels({
+						config,
+						health,
+						endpoint: endpointOf(config, modelKey),
+						active: modelKey,
+						installed: installedWeights(config.modelsDir),
+						all: action === "all",
+					});
+					for (const line of block.trimEnd().split("\n")) live.line(line);
+					live.line(dim("/models all lists the rest; /models switch <key> changes model; /models info <key> shows everything"));
 					return "continue";
 				}
 
@@ -579,8 +586,16 @@ export async function runTui(deps: UiDeps): Promise<number> {
 					return "continue";
 				}
 				if (config.models[key] === undefined) {
-					live.line(formatError(`unknown model "${key}" — known: ${Object.keys(config.models).join(", ")}`));
-					return "continue";
+					// A name the endpoint serves needs no entry first, exactly as `-m` and
+					// `og models use` treat it — the listing above offers it, so refusing
+					// it here would advertise a model this surface cannot reach.
+					const health = deps.probeEndpoint === undefined ? { reachable: false } : await deps.probeEndpoint();
+					const servedIds = (health.models ?? []).map((model) => model.id);
+					if (!servedIds.includes(key)) {
+						const known = [...new Set([...servedIds, ...Object.keys(config.models)])];
+						live.line(formatError(`unknown model "${key}" — known: ${known.join(", ") || "(nothing served, nothing configured)"}`));
+						return "continue";
+					}
 				}
 				if (key === modelKey) {
 					live.line(dim(`already on ${key}`));
@@ -847,13 +862,14 @@ export const COMMAND_NAMES: readonly string[] = [
 ];
 
 export const COMMAND_SUBCOMMANDS: Readonly<Record<string, readonly string[]>> = {
-	models: ["list", "switch", "info"],
+	models: ["list", "all", "switch", "info"],
 };
 
 function helpLines(): string[] {
 	return [
 		`${bold("/help")}                  this list`,
-		`${bold("/models [list]")}         configured models with endpoint, window and sampling`,
+		`${bold("/models [list]")}         what the endpoint is serving right now`,
+		`${bold("/models all")}            every configured entry as well, served or not`,
 		`${bold("/models switch <key>")}   change the active model`,
 		`${bold("/models info <key>")}     everything configured for one model`,
 		`${bold("/usage")}                 context occupancy, token usage, decode rate and ttft`,

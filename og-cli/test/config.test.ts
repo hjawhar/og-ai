@@ -21,8 +21,10 @@ import {
 	DEFAULT_CONTEXT_WINDOW,
 	endpointOf,
 	modelSpecOf,
+	resolveActiveModel,
 	wireModelOf,
 } from "../src/config/load.ts";
+import type { ServedModel } from "../src/provider/types.ts";
 import { ConfigError } from "../src/config/schema.ts";
 import type { ModelSpec, OgConfig } from "../src/config/schema.ts";
 
@@ -174,34 +176,30 @@ describe("layer precedence", () => {
 		expect(result.config?.agent.temperature).toBe(0.5);
 		// Untouched defaults remain.
 		expect(result.config?.agent.maxTokens).toBe(DEFAULT_CONFIG.agent.maxTokens);
-		expect(result.config?.model).toBe("qwen3-coder-30b");
+		// Nothing is shipped to pick, so the model stays unchosen until discovery.
+		expect(result.config?.model).toBe("");
 	});
 
 	test("home layer alone is applied when no workspace config exists", () => {
 		const result = resolveConfig({
-			home: { model: "devstral-24b", endpoint: "https://api.example.com/v1-compat" },
+			home: { model: "home-model", models: { "home-model": { contextWindow: 4096 } }, endpoint: "https://api.example.com/v1-compat" },
 		});
-		expect(result.config?.model).toBe("devstral-24b");
+		expect(result.config?.model).toBe("home-model");
 		expect(result.config?.endpoint).toBe("https://api.example.com/v1-compat");
-		// Every shipped model survives a scalar patch elsewhere.
-		expect(Object.keys(result.config?.models ?? {}).sort()).toEqual(
-			Object.keys(DEFAULT_CONFIG.models).sort(),
-		);
+		// The entry a layer declared is the only one there: og ships none.
+		expect(Object.keys(result.config?.models ?? {})).toEqual(["home-model"]);
 	});
 
 	test("a model patch merges per key and leaves sibling models intact", () => {
 		const result = resolveConfig({
-			ws: { models: { "qwen3-coder-30b": { contextWindow: 16384 } } },
+			home: { models: { alpha: { contextWindow: 8192, topP: 0.9 }, beta: { contextWindow: 65536 } } },
+			ws: { models: { alpha: { contextWindow: 16384 } } },
 		});
 
-		const patched = specOrThrow(result.config, "qwen3-coder-30b");
-		const original = DEFAULT_CONFIG.models["qwen3-coder-30b"] as ModelSpec;
-		expect(patched).toEqual({ ...original, contextWindow: 16384 });
-		expect(Object.keys(result.config?.models ?? {}).sort()).toEqual(
-			Object.keys(DEFAULT_CONFIG.models).sort(),
-		);
-		// The sibling it shares sampling defaults with is untouched.
-		expect(specOrThrow(result.config, "qwen3-coder-30b-long").contextWindow).toBe(65536);
+		// The workspace patch replaces one field and leaves the rest of that entry.
+		expect(specOrThrow(result.config, "alpha")).toEqual({ contextWindow: 16384, topP: 0.9 });
+		expect(Object.keys(result.config?.models ?? {}).sort()).toEqual(["alpha", "beta"]);
+		expect(specOrThrow(result.config, "beta").contextWindow).toBe(65536);
 	});
 
 	test("arrays replace instead of concatenating", () => {
@@ -227,28 +225,31 @@ describe("layer precedence", () => {
 describe("environment layer", () => {
 	test("OG_* variables are applied over file layers", () => {
 		const result = resolveConfig({
-			ws: { endpoint: "http://file.local:1", model: "qwen3-coder-30b" },
+			ws: { endpoint: "http://file.local:1", model: "file-model", models: { "file-model": { contextWindow: 4096 } } },
 			env: {
 				OG_ENDPOINT: "http://env.local:2",
-				OG_MODEL: "devstral-24b",
+				OG_MODEL: "env-model",
 				OG_API_KEY: "env-key",
 				OG_STATE_DIR: "C:\\env-state",
+				OG_MODELS_DIR: "C:\\env-weights",
 			},
 		});
 
 		expect(result.config?.endpoint).toBe("http://env.local:2");
-		expect(result.config?.model).toBe("devstral-24b");
+		// A name only the environment gave is synthesised: no entry has to exist first.
+		expect(result.config?.model).toBe("env-model");
 		expect(result.config?.apiKey).toBe("env-key");
 		expect(result.config?.stateDir).toBe("C:\\env-state");
+		expect(result.config?.modelsDir).toBe("C:\\env-weights");
 	});
 
-	test("only those four variables exist: an OG_* knob og dropped is inert", () => {
+	test("only those five variables exist: an OG_* knob og dropped is inert", () => {
 		// og no longer starts a server, so there is nothing to opt out of. The
 		// variable must be ignored outright rather than resurrect a hidden branch.
-		// `stateDir` is derived from each case's own temp home, so it is the one
-		// field two runs cannot agree on.
+		// `stateDir` and `modelsDir` are derived from each case's own temp home, so
+		// they are the fields two runs cannot agree on.
 		const shape = (result: CaseResult): string =>
-			JSON.stringify({ ...result.config, stateDir: "" });
+			JSON.stringify({ ...result.config, stateDir: "", modelsDir: "" });
 
 		const bare = resolveConfig({});
 		const withGhosts = resolveConfig({ env: { OG_NO_AUTOSTART: "1", OG_LOCAL_ENDPOINT: "1" } });
@@ -258,11 +259,11 @@ describe("environment layer", () => {
 
 	test("explicit overrides beat the environment layer", () => {
 		const result = resolveConfig({
-			env: { OG_ENDPOINT: "http://env.local:2", OG_MODEL: "devstral-24b" },
-			overrides: { endpoint: "http://flag.local:3", model: "qwen3-coder-30b-fast" },
+			env: { OG_ENDPOINT: "http://env.local:2", OG_MODEL: "env-model" },
+			overrides: { endpoint: "http://flag.local:3", model: "flag-model" },
 		});
 		expect(result.config?.endpoint).toBe("http://flag.local:3");
-		expect(result.config?.model).toBe("qwen3-coder-30b-fast");
+		expect(result.config?.model).toBe("flag-model");
 	});
 
 	test("overrides merge nested objects rather than replacing them", () => {
@@ -307,11 +308,15 @@ describe("pass-through models", () => {
 	});
 
 	test("`--context-window` also overrides a configured model's window", () => {
-		const result = resolveConfig({ contextWindow: 12_288, modelSpecKey: "qwen3-coder-30b" });
-		expect(result.config?.model).toBe("qwen3-coder-30b");
+		const result = resolveConfig({
+			home: { model: "local", models: { local: { contextWindow: 32768, topK: 20 }, sibling: { contextWindow: 65536 } } },
+			contextWindow: 12_288,
+			modelSpecKey: "local",
+		});
+		expect(result.config?.model).toBe("local");
 		expect(result.modelSpec?.contextWindow).toBe(12_288);
-		// Only the active model is resized; its siblings keep their measured windows.
-		expect(specOrThrow(result.config, "qwen3-coder-30b-long").contextWindow).toBe(65536);
+		// Only the active model is resized; its siblings keep their own windows.
+		expect(specOrThrow(result.config, "sibling").contextWindow).toBe(65536);
 		// The sampling knobs of the configured entry survive the resize.
 		expect(result.modelSpec?.topK).toBe(20);
 	});
@@ -531,16 +536,16 @@ describe("validation", () => {
 });
 
 describe("modelSpecOf", () => {
-	test("defaults to the active model", () => {
-		const active = DEFAULT_CONFIG.models[DEFAULT_CONFIG.model];
-		expect(active).toBeDefined();
-		expect(modelSpecOf(DEFAULT_CONFIG)).toBe(active as ModelSpec);
+	test("an unchosen model yields the fallback window rather than throwing", () => {
+		// og ships no entries, and a reachability probe is built before discovery
+		// can name anything.
+		expect(DEFAULT_CONFIG.model).toBe("");
+		expect(modelSpecOf(DEFAULT_CONFIG)).toEqual({ contextWindow: DEFAULT_CONTEXT_WINDOW });
 	});
 
 	test("returns the requested spec when it exists", () => {
-		expect(modelSpecOf(DEFAULT_CONFIG, "qwen3-coder-30b-fast")).toEqual(
-			DEFAULT_CONFIG.models["qwen3-coder-30b-fast"] as ModelSpec,
-		);
+		const cfg: OgConfig = { ...DEFAULT_CONFIG, models: { chosen: { contextWindow: 4096, topP: 0.9 } } };
+		expect(modelSpecOf(cfg, "chosen")).toEqual(cfg.models["chosen"] as ModelSpec);
 	});
 
 	test("rejects an unknown key as a ConfigError listing the known ones", () => {
@@ -592,39 +597,34 @@ describe("DEFAULT_CONFIG invariants", () => {
 		// Every resolveConfig() case asserts defaultsUnchanged; this pins the
 		// hardest case, where nested objects and arrays are both patched.
 		const result = resolveConfig({
-			home: { models: { "qwen3-coder-30b": { topK: 40 } }, tools: { denyPaths: [] } },
+			home: { models: { alpha: { contextWindow: 4096, topK: 40 } }, tools: { denyPaths: [] } },
 			ws: { agent: { maxSteps: 2 } },
-			overrides: { models: { "devstral-24b": { maxTokens: 4096 } } },
+			overrides: { models: { beta: { contextWindow: 8192, maxTokens: 4096 } } },
 		});
 		expect(result.defaultsUnchanged).toBe(true);
-		expect(result.config?.models["qwen3-coder-30b"]?.topK).toBe(40);
-		expect(result.config?.models["devstral-24b"]?.maxTokens).toBe(4096);
-		expect(DEFAULT_CONFIG.models["qwen3-coder-30b"]?.topK).toBe(20);
-		expect(DEFAULT_CONFIG.models["devstral-24b"]?.maxTokens).toBeUndefined();
+		expect(result.config?.models["alpha"]?.topK).toBe(40);
+		expect(result.config?.models["beta"]?.maxTokens).toBe(4096);
+		// The shipped record is empty and stays empty.
+		expect(DEFAULT_CONFIG.models).toEqual({});
 	});
 
-	test("exactly the four measured operating points ship, with their measured windows", () => {
-		// Copied from og-llama-cpp/docs/benchmarks.md; changing one here without a
-		// re-run there makes the record a lie.
-		const measured: Record<string, number> = {
-			"qwen3-coder-30b": 32768,
-			"qwen3-coder-30b-long": 65536,
-			"qwen3-coder-30b-fast": 32768,
-			"devstral-24b": 8192,
-		};
-		expect(Object.keys(DEFAULT_CONFIG.models).sort()).toEqual(Object.keys(measured).sort());
-		for (const [key, contextWindow] of Object.entries(measured)) {
-			expect(DEFAULT_CONFIG.models[key]?.contextWindow, key).toBe(contextWindow);
-		}
-		expect(DEFAULT_CONFIG.models[DEFAULT_CONFIG.model]).toBeDefined();
+	test("no models ship at all: every name og shows is discovered or configured", () => {
+		// A table of names here could only be a guess about somebody else's machine,
+		// and a wrong guess is not inert — a llama-server answers a request for a
+		// model it does not have with whatever it does have.
+		expect(DEFAULT_CONFIG.models).toEqual({});
+		expect(DEFAULT_CONFIG.model).toBe("");
 	});
 
-	test("no shipped model pins a temperature: agent.temperature governs", () => {
-		// Qwen recommends 0.7 for chat, but tool-call JSON degrades there; 0.2 was
-		// what the CLI actually sent before, and it stays the single source.
-		for (const [key, spec] of Object.entries(DEFAULT_CONFIG.models)) {
-			expect(spec.temperature, key).toBeUndefined();
-		}
+	test("the fallback window is the only per-model number og carries", () => {
+		// A local server reports `meta.n_ctx` and that wins; this is for endpoints
+		// that say nothing. Conservative on purpose: budgeting above the server's
+		// real window makes it truncate silently.
+		expect(DEFAULT_CONTEXT_WINDOW).toBe(32768);
+	});
+
+	test("sampling is not pinned anywhere: agent.temperature governs", () => {
+		// Nothing ships a per-model recipe, so the agent block is the single source.
 		expect(DEFAULT_CONFIG.agent.temperature).toBe(0.2);
 	});
 
@@ -690,5 +690,64 @@ describe("DEFAULT_CONFIG invariants", () => {
 		const { compactThresholdPct, contextReservePct } = DEFAULT_CONFIG.agent;
 		expect(compactThresholdPct).toBeGreaterThan(0);
 		expect(compactThresholdPct).toBeLessThanOrEqual(1 - contextReservePct);
+	});
+});
+
+/**
+ * og ships no model entries, so the active model is discovered. A `llama-server`
+ * serves what it loaded and answers to any name, which is why insisting on the
+ * wrong one does not fail — it returns the loaded model's output budgeted from
+ * the wrong entry. This decides what og talks to, and it must never override a
+ * name somebody actually chose.
+ */
+describe("resolveActiveModel", () => {
+	const cfg = (overrides: Partial<OgConfig> = {}): OgConfig => ({ ...structuredClone(DEFAULT_CONFIG), ...overrides });
+	const served = (...models: ServedModel[]): ServedModel[] => models;
+
+	test("nothing chosen follows the one model the endpoint serves, window and all", () => {
+		const only = { id: "served-a", contextWindow: 8192 };
+		expect(resolveActiveModel(cfg(), served(only), false)).toEqual(only);
+	});
+
+	test("a pinned model is never overridden, however wrong it looks", () => {
+		// An explicit -m, OG_MODEL or config `model` is a statement; a typo there
+		// should fail loudly rather than be quietly replaced.
+		expect(resolveActiveModel(cfg(), served({ id: "served-a" }), true)).toBeUndefined();
+	});
+
+	test("nothing to adopt when the configured model is already the served one", () => {
+		const config = cfg({ model: "local", models: { local: { contextWindow: 4096 } } });
+		expect(resolveActiveModel(config, served({ id: "local" }), false)).toBeUndefined();
+	});
+
+	test("several served models are not guessed between", () => {
+		expect(resolveActiveModel(cfg(), served({ id: "a" }, { id: "b" }), false)).toBeUndefined();
+	});
+
+	test("an endpoint naming nothing leaves the configured model alone", () => {
+		expect(resolveActiveModel(cfg(), [], false)).toBeUndefined();
+	});
+
+	test("matching is against the wire name, so a spec's `id` override counts", () => {
+		const config = cfg({ model: "local", models: { local: { contextWindow: 8192, id: "served-as-this" } } });
+		expect(resolveActiveModel(config, served({ id: "served-as-this" }), false)).toBeUndefined();
+		expect(resolveActiveModel(config, served({ id: "something-else" }), false)?.id).toBe("something-else");
+	});
+});
+
+describe("shipped defaults", () => {
+	test("no models are shipped: og discovers them instead of guessing about this machine", () => {
+		expect(DEFAULT_CONFIG.models).toEqual({});
+		// "" is the honest starting state, and validation accepts it.
+		expect(DEFAULT_CONFIG.model).toBe("");
+	});
+
+	test("an unchosen model resolves to fallback knobs rather than throwing", () => {
+		// A reachability probe has to be built before discovery can name anything.
+		expect(modelSpecOf(DEFAULT_CONFIG).contextWindow).toBe(DEFAULT_CONTEXT_WINDOW);
+	});
+
+	test("a named model with no entry is still an error: that is a typo, not a discovery", () => {
+		expect(() => modelSpecOf({ ...DEFAULT_CONFIG, model: "typo" })).toThrow(ConfigError);
 	});
 });

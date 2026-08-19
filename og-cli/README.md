@@ -123,24 +123,43 @@ is down, `og` says so and stops.
 
 ```console
 $ og models
-* qwen3-coder-30b        qwen3-coder-30b @ http://127.0.0.1:8127
-  window 32768 · top-p 0.8 · top-k 20 · min-p 0 · repeat-penalty 1.05
-  qwen3-coder-30b-long   qwen3-coder-30b-long @ http://127.0.0.1:8127
-  window 65536 · top-p 0.8 · top-k 20 · min-p 0 · repeat-penalty 1.05
-  qwen3-coder-30b-fast   qwen3-coder-30b-fast @ http://127.0.0.1:8127
-  window 32768 · top-p 0.8 · top-k 20 · min-p 0 · repeat-penalty 1.05
-  devstral-24b           devstral-24b @ http://127.0.0.1:8127
-  window 8192 · top-p 0.95
-og models use <key> sets the default; -m <name> accepts any model the endpoint serves
+* Qwen2.5-Coder-0.5B-Instruct-Q4_K_M       serving now
+                                           window 4096 (as served)
+  Laguna-XS-2.1-APEX-I-Mini                on disk, not loaded
+                                           window 32768 (og's fallback — the endpoint did not say)
+  Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL  on disk, not loaded
+                                           window 32768 (og's fallback — the endpoint did not say)
+og follows the endpoint while no model is pinned — og models use Qwen2.5-Coder-0.5B-Instruct-Q4_K_M to fix it in place
 
 $ og -p "reply with the single word ready" --max-steps 1
 ready
 ```
 
-`og models` is pure config resolution — it opens no socket and needs nothing listening, so it
-answers "is my config what I think it is, and where would this model's requests go?". The second
-command is the first thing that needs a server: `og` runs one health probe against `endpoint`
-before the run and fails fast if nothing answers.
+**Nothing about a model is hardcoded. og discovers all of it.** No model names, context windows or
+sampling recipes ship: `models` starts empty and `model` starts `""`. A table of names could only be
+a guess about somebody else's machine, and a wrong guess is not inert — a `llama-server` answers a
+request for a model it does not have with whatever it *does* have, so og would receive the loaded
+model's output budgeted from the wrong entry, silently.
+
+Three sources, three kinds of row:
+
+- **serving now** — from `GET /v1/models`, the only authority on what a request can reach. Its
+  `window … (as served)` is the endpoint's own `meta.n_ctx`: the context length the server actually
+  allocated, so og cannot disagree with it.
+- **on disk, not loaded** — `.gguf` files in `modelsDir` (`OG_MODELS_DIR`, the same variable
+  og-llama-cpp uses). Shown so the list matches what you have; never acted on, because og starts no
+  server. Loading one is [`../og-llama-cpp`](../og-llama-cpp)'s job.
+- **configured** — entries you wrote, with the knobs you gave them. `og models --all` prints the ones
+  the endpoint is not serving.
+
+When nothing is pinned and the endpoint serves exactly one model, that model is active. An explicit
+`-m`, an `OG_MODEL`, or a `model` in either config file pins it and is never overridden — a typo
+there should fail loudly rather than be quietly replaced. Two models served with nothing pinned is an
+error naming both, because guessing between them is not og's call.
+
+It runs one `GET /v1/models` to learn all this, and needs nothing listening: with the endpoint down
+it still lists what is on disk, says nothing answered, claims nothing about what is loaded, and exits
+**0**. The second command is the first one that truly requires a server.
 
 ```console
 $ og -p "hello"
@@ -175,7 +194,7 @@ git diff | og -p "review this"          # piped stdin becomes the prompt
 og --json -p "reply with the single word ready"  # JSONL events for CI
 og -c -p "now add tests for it"         # continue the latest session for this directory
 og -r 7d8ba2ec-635d-4f9e-bd1e-ca0ebe7fd9fd     # resume a specific session
-og -m qwen3-coder-30b-fast -p "explain src/agent/loop.ts"
+og -m your-model -p "explain src/agent/loop.ts"
 og -m gpt-4o --endpoint https://api.openai.com --context-window 128000 -p "..."
 og --endpoint http://gpubox.lan:8127 -p "review this diff"
 og models                               # also: models use <key>
@@ -204,8 +223,8 @@ is exactly one place on screen where context occupancy lives.
 Idle, then running:
 
 ```
-qwen3-coder-30b · ~/Workspace/og-ai/og-cli · 127.0.0.1:8199 · ctx █░░░░░░░░░ 6% 2.1k/32.8k · 0 tok
-⠸ qwen3-coder-30b · generating · 4.2s · 82.1 tok/s · ttft 380ms · ctx ██░░░░░░░░ 16% 5.2k/32.8k
+your-model · ~/Workspace/og-ai/og-cli · 127.0.0.1:8199 · ctx █░░░░░░░░░ 6% 2.1k/32.8k · 0 tok
+⠸ your-model · generating · 4.2s · 82.1 tok/s · ttft 380ms · ctx ██░░░░░░░░ 16% 5.2k/32.8k
 ```
 
 | Field | Meaning |
@@ -232,9 +251,9 @@ The row sheds segments as the terminal narrows — the endpoint first, then the 
 finally the gauge itself compacts:
 
 ```
-qwen3-coder-30b · ~/Workspace/og-ai/og-cli · ctx ██░░░░░░░░ 16% 5.2k/32.8k · 12.4k tok
-qwen3-coder-30b · ~/Workspace/og-ai/og-cli · ctx ██░░░░░░░░ 16% 5.2k/32.8k
-qwen3-coder-30b · ctx 16%/32.8k ── add peek() t…
+your-model · ~/Workspace/og-ai/og-cli · ctx ██░░░░░░░░ 16% 5.2k/32.8k · 12.4k tok
+your-model · ~/Workspace/og-ai/og-cli · ctx ██░░░░░░░░ 16% 5.2k/32.8k
+your-model · ctx 16%/32.8k ── add peek() t…
 ```
 
 It reflows on resize, gives itself back if the terminal shrinks below six rows, emits nothing when
@@ -298,7 +317,7 @@ runtime
 
 endpoint
   url        http://127.0.0.1:8127
-  model      qwen3-coder-30b
+  model      your-model
   context    32768
 ```
 
@@ -311,8 +330,8 @@ it is on is even the machine serving the model. GPU state belongs to whoever run
 ### Switching models
 
 ```sh
-og models                    # every configured entry, its wire id and its effective endpoint
-og models use <key>          # persist the default to ~/.og/config.json
+og models                    # what the endpoint serves, plus every configured entry and its knobs
+og models use <name>         # persist the default to ~/.og/config.json; a served name needs no entry first
 
 /models list                 # inside the TUI
 /models switch <key>         # change model for this session
@@ -405,11 +424,12 @@ with a `ConfigError` naming the field — malformed JSON never silently degrades
 | --- | --- |
 | `endpoint` | **Base URL** of the OpenAI-compatible API — `og` appends `/v1/chat/completions` itself, so this is `https://api.openai.com`, not `.../v1`. Trailing slashes are trimmed. Default `http://127.0.0.1:8127` |
 | `apiKey` | Bearer token used when the active model does not name its own `apiKeyEnv`. Prefer `OG_API_KEY` or `apiKeyEnv` over writing a key into a file |
-| `model` | Active key in `models`; any name at all when given on the command line or in `OG_MODEL` — see [Pass-through models](#pass-through-models). Default `qwen3-coder-30b` |
-| `models` | Record of model key -> spec, below |
+| `model` | Active key in `models`; any name at all when given on the command line or in `OG_MODEL` — see [Pass-through models](#pass-through-models). Default `""`, meaning **discover it**: og adopts the model the endpoint serves unless you pin one |
+| `models` | Record of model key -> spec, below. **Empty by default** — og ships no model entries |
 | `agent` | Turn loop and context budget, below |
 | `tools` | Tool enablement, approval and caps, below |
 | `stateDir` | Where `config.json`, `sessions.db` and `history` live. Default `~/.og` |
+| `modelsDir` | Where weights live, listed by `og models` as `on disk, not loaded`. og never loads one. Default `~/models`, or `OG_MODELS_DIR` — the same variable og-llama-cpp uses |
 
 ### `models` entries
 
@@ -496,7 +516,6 @@ Defaults are `bash: "unsafe-only"`, `edit: "never"`.
 
 ```json
 {
-  "model": "qwen3-coder-30b",
   "agent": { "maxSteps": 40 },
   "tools": {
     "edit": { "approval": "never" },
@@ -525,20 +544,23 @@ In headless CI this config would deny all `bash` calls, so CI should ship its ow
 
 ### Worked backend configs
 
-**A. A local `llama-server`, started by `og-llama-cpp`.** This is the shipped default, so the file
-below is only needed if you change a port or want a narrower window than the measured one. Bring
-the server up first and leave it in the foreground:
+**A. A local `llama-server`, started by `og-llama-cpp`.** No file is needed at all: the default
+`endpoint` already points at it, and og adopts whichever model it is serving with the context window
+that server reported. Write an entry only to **pin** a model or to override a knob — a narrower
+window than the server allocated, say, or sampling the model's authors recommend. Bring the server up
+first and leave it in the foreground:
 
 ```sh
-cd ../og-llama-cpp && bun run serve.ts --profile qwen3-coder-30b
+cd ../og-llama-cpp && bun run serve.ts --list   # the measured operating points, by name
+cd ../og-llama-cpp && bun run serve.ts          # the default one
 ```
 
 ```json
 {
   "endpoint": "http://127.0.0.1:8127",
-  "model": "qwen3-coder-30b",
+  "model": "the-id-/v1/models-reports",
   "models": {
-    "qwen3-coder-30b": {
+    "the-id-/v1/models-reports": {
       "contextWindow": 32768,
       "topP": 0.8,
       "topK": 20,
@@ -549,9 +571,10 @@ cd ../og-llama-cpp && bun run serve.ts --profile qwen3-coder-30b
 }
 ```
 
-No key is needed: `llama-server` on loopback is unauthenticated. `contextWindow` must be `<=` the
-`-c` the server was started with — `serve.ts --profile qwen3-coder-30b` uses 32768, which is
-where this number comes from.
+No key is needed: `llama-server` on loopback is unauthenticated. The key of the entry must be the id
+`GET /v1/models` reports — `serve.ts` aliases a model to its filename without `.gguf` — and
+`contextWindow` must be `<=` the `-c` the server was started with. `og models` prints both numbers
+when they disagree, which is the only way that mismatch ever surfaces.
 
 **B. OpenAI proper.** The key lives in the environment, never in the file. `topK`, `minP` and
 `repeatPenalty` are deliberately absent: OpenAI rejects unknown arguments, so an entry that sets
@@ -580,9 +603,9 @@ mid-session.
 ```json
 {
   "endpoint": "http://127.0.0.1:8127",
-  "model": "qwen3-coder-30b",
+  "model": "your-model",
   "models": {
-    "qwen3-coder-30b": { "contextWindow": 32768, "topP": 0.8, "topK": 20, "minP": 0, "repeatPenalty": 1.05 },
+    "your-model": { "contextWindow": 32768, "topP": 0.8, "topK": 20, "minP": 0, "repeatPenalty": 1.05 },
     "sonnet": {
       "id": "anthropic/claude-sonnet-4",
       "endpoint": "https://openrouter.ai/api",
@@ -609,10 +632,10 @@ sampling is exactly why those knobs live on the model rather than at the top lev
 
 | Entry | `contextWindow` | Sampling |
 | --- | --- | --- |
-| `qwen3-coder-30b` *(default)* | 32768 | `top-p 0.8 · top-k 20 · min-p 0 · repeat-penalty 1.05` |
-| `qwen3-coder-30b-long` | 65536 | same |
-| `qwen3-coder-30b-fast` | 32768 | same |
-| `devstral-24b` | 8192 | `top-p 0.95` |
+| `your-model` *(default)* | 32768 | `top-p 0.8 · top-k 20 · min-p 0 · repeat-penalty 1.05` |
+| `your-other-model` | 65536 | same |
+| `your-model` | 32768 | same |
+| `your-model` | 8192 | `top-p 0.95` |
 
 `agent.temperature` (0.2) governs all four; none sets its own. The Qwen knobs are the model
 author's recommended values, and because `topK`/`minP`/`repeatPenalty` are llama.cpp/vLLM
@@ -625,17 +648,17 @@ running llama.cpp b10488 — and the offload split that makes it possible now li
 
 | Served as | Weights the server loads | ctx | VRAM (MiB) | Prefill (tok/s) | Generation (tok/s) | Pick when |
 | --- | --- | --- | --- | --- | --- | --- |
-| `qwen3-coder-30b` | `Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL.gguf` (16.45 GiB) | 32768 | 14714 | 1476 | 82.1 | Default. Best quality-per-token that still leaves ~1.6 GiB of headroom |
-| `qwen3-coder-30b-long` | same Q4_K_XL | 65536 | 15082 | 1238 | 69.5 | Large refactors and long transcripts; costs ~15% throughput for 2x context |
-| `qwen3-coder-30b-fast` | `Qwen3-Coder-30B-A3B-Instruct-UD-Q3_K_XL.gguf` (12.86 GiB) | 32768 | 14569 | 2957 | 136.5 | Iteration speed over precision: ~1.7x generation, 2x prefill, at Q3 quality |
-| `devstral-24b` | `Devstral-Small-2507-Q4_K_M.gguf` (13.35 GiB) | 8192 | 15045 | 2292 | 51.3 | Second opinion from a dense model. 8k window is the hard ceiling on 16 GiB |
+| `your-model` | `Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL.gguf` (16.45 GiB) | 32768 | 14714 | 1476 | 82.1 | Default. Best quality-per-token that still leaves ~1.6 GiB of headroom |
+| `your-other-model` | same Q4_K_XL | 65536 | 15082 | 1238 | 69.5 | Large refactors and long transcripts; costs ~15% throughput for 2x context |
+| `your-model` | `Qwen3-Coder-30B-A3B-Instruct-UD-Q3_K_XL.gguf` (12.86 GiB) | 32768 | 14569 | 2957 | 136.5 | Iteration speed over precision: ~1.7x generation, 2x prefill, at Q3 quality |
+| `your-model` | `Devstral-Small-2507-Q4_K_M.gguf` (13.35 GiB) | 8192 | 15045 | 2292 | 51.3 | Second opinion from a dense model. 8k window is the hard ceiling on 16 GiB |
 
 Read that table as **what the referenced server delivers**, not as anything `og` sets. Measured
 under Windows 11 with a 6k-token prefill and a 256-token generation, `q8_0` KV, flash attention
 on, VRAM sampled with `nvidia-smi` while loaded; idle desktop use was 968 MiB of the 16303 MiB
 card, so the working budget is ~15200 MiB. Dense 24B at Q4 leaves room for only 8k of KV once
 fully offloaded — buying 32k by partial offload measured 14.1 tok/s generation, a 3.6x loss — so
-full offload with a short window is the only sane operating point for `devstral-24b`.
+full offload with a short window is the only sane operating point for `your-model`.
 
 A `llama-bench` spot-check after the box moved to Ubuntu 26.04 (CUDA 13.3 toolkit, driver 595.84,
 same b10488 source tag compiled locally) reported **1611 tok/s prefill and 102 tok/s generation**

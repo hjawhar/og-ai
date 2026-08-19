@@ -6,13 +6,13 @@
  * destroying the reserved-region illusion, every segment is measured and the
  * least useful ones are dropped rather than allowed to overflow.
  *
- * Idle:
+ * Idle, with whatever model the endpoint turned out to be serving:
  * ```
- * qwen3-coder-30b · ~/demo-ace · 127.0.0.1:8127 · ctx ██░░░░░░░░ 16% 5.2k/32.8k · 12.4k tok ── add peek() to lru
+ * <model> · ~/demo-ace · 127.0.0.1:8127 · ctx ██░░░░░░░░ 16% 5.2k/32.8k · 12.4k tok ── add peek() to lru
  * ```
  * Running:
  * ```
- * ⠹ qwen3-coder-30b · generating · 4.2s · 82.1 tok/s · ttft 380ms · ctx ██░░░░░░░░ 16% 5.2k/32.8k
+ * ⠹ <model> · generating · 4.2s · 82.1 tok/s · ttft 380ms · ctx ██░░░░░░░░ 16% 5.2k/32.8k
  * ```
  */
 
