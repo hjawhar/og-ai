@@ -1,0 +1,6 @@
+@if (lines().length === 0) {
+  <p class="empty">Nothing has been launched from this page yet.</p>
+} @else {
+  <pre #pane class="pane font-mono">@for (line of lines(); track $index) {{{ line }}
+}</pre>
+}

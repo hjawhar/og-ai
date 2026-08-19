@@ -1,0 +1,87 @@
+:host {
+  display: block;
+  min-height: 100%;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  flex-wrap: wrap;
+  padding: 1rem 1.5rem;
+  border-bottom: 1px solid var(--surface-line);
+  background: var(--surface-panel);
+
+  &__title {
+    margin: 0;
+    font-size: 1rem;
+    font-weight: 650;
+    letter-spacing: 0.01em;
+    color: var(--ink-bright);
+  }
+
+  &__status {
+    flex: 1 1 22rem;
+    min-width: 18rem;
+  }
+}
+
+.page {
+  max-width: 84rem;
+  margin: 0 auto;
+  padding: 1.5rem 1.5rem 3rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+
+.section {
+  display: flex;
+  flex-direction: column;
+  gap: 0.625rem;
+
+  &__title {
+    display: flex;
+    align-items: baseline;
+    gap: 0.625rem;
+    flex-wrap: wrap;
+    margin: 0;
+    font-size: 0.75rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-dim);
+  }
+
+  &__hint {
+    font-size: 0.6875rem;
+    text-transform: none;
+    letter-spacing: 0;
+    color: var(--ink-faint);
+    overflow-wrap: anywhere;
+  }
+}
+
+.note {
+  margin: 0;
+  font-size: 0.75rem;
+  line-height: 1.6;
+  color: var(--ink-dim);
+
+  strong {
+    color: var(--ink-bright);
+    font-weight: 600;
+  }
+}
+
+// A failed poll is stated, never swallowed: a stale page that looks live is the
+// one thing worse than an error.
+.banner {
+  margin: 0;
+  padding: 0.625rem 0.875rem;
+  border: 1px solid color-mix(in srgb, var(--verdict-no) 40%, var(--surface-line));
+  border-radius: 0.5rem;
+  background: color-mix(in srgb, var(--verdict-no) 10%, transparent);
+  color: var(--verdict-no);
+  font-size: 0.8125rem;
+}

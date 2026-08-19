@@ -1,0 +1,63 @@
+<section class="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+  <article class="card card--wide">
+    <h3 class="card__key">VRAM budget for a model</h3>
+    <p class="card__value text-2xl">{{ hardware().budgetMiB | mib: 'gib' }}</p>
+    <p class="card__note">
+      @if (gpu(); as card) {
+        {{ card.totalMiB | mib }} on the card, minus {{ hardware().headroomMiB | mib }} of headroom.
+        Weights plus KV cache plus runtime must fit under it.
+      } @else {
+        No CUDA device is visible, so every verdict below falls back to RAM.
+      }
+    </p>
+  </article>
+
+  <article class="card">
+    <h3 class="card__key">GPU</h3>
+    @if (gpu(); as card) {
+      <p class="card__value">{{ card.name }}</p>
+      <div class="meter" [class.meter--hot]="budgetAtRisk()">
+        <i [style.width.%]="usedPct()"></i>
+      </div>
+      <p class="card__note">
+        {{ card.usedMiB | mib }} in use · {{ card.freeMiB | mib }} free
+        @if (serving()) {
+          <span class="text-ink-faint">— a server is loaded, so most of that is its weights</span>
+        } @else if (budgetAtRisk()) {
+          <span class="warn">— less free than the budget; close GPU-heavy apps before launching</span>
+        }
+      </p>
+    } @else {
+      <p class="card__value">none detected</p>
+      <p class="card__note">nvidia-smi reported no device.</p>
+    }
+  </article>
+
+  <article class="card">
+    <h3 class="card__key">Engine</h3>
+    @if (engine().present) {
+      <p class="card__value font-mono">{{ engine().build ?? 'current' }}</p>
+      <p class="card__note">
+        @if (engine().devices.length > 0) {
+          @for (device of engine().devices; track device) {
+            <span class="block font-mono text-2xs">{{ device }}</span>
+          }
+        } @else {
+          Reports no accelerator — a CPU-only build runs ~100x slower.
+        }
+      </p>
+    } @else {
+      <p class="card__value warn">not installed</p>
+      <p class="card__note font-mono text-2xs">{{ engine().binary }}</p>
+    }
+  </article>
+
+  <article class="card">
+    <h3 class="card__key">Host</h3>
+    <p class="card__value">{{ hardware().cpu }}</p>
+    <p class="card__note">
+      {{ hardware().threads }} threads · {{ hardware().ramTotalMiB | mib: 'gib' }} RAM,
+      {{ hardware().ramFreeMiB | mib: 'gib' }} free · {{ hardware().os }}
+    </p>
+  </article>
+</section>

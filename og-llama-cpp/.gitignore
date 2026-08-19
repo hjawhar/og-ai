@@ -1,6 +1,13 @@
 # dependencies (bun.lock IS committed on purpose — reproducible installs)
 node_modules/
 
+# the Angular workspace's build output and CLI cache
+ui/dist/
+ui/.angular/
+
+# a partial download is not usable weights
+*.gguf.part
+
 # logs, including the sweep driver's server capture
 *.log
 

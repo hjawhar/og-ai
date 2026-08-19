@@ -1,0 +1,6 @@
+<span class="badge" [class]="'badge--' + tone()" [title]="fit().detail">
+  {{ fit().label }}
+</span>
+@if (fit().suggestion) {
+  <code class="suggestion font-mono">{{ fit().suggestion }}</code>
+}

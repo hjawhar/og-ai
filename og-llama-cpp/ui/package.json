@@ -1,0 +1,33 @@
+{
+  "name": "og-llama-cpp-ui",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Model page for the pinned llama.cpp build: hardware, installed weights, and whether each one fits this GPU",
+  "license": "MIT",
+  "scripts": {
+    "ng": "ng",
+    "start": "ng serve",
+    "build": "ng build",
+    "watch": "ng build --watch --configuration development",
+    "typecheck": "tsc -p tsconfig.app.json --noEmit"
+  },
+  "packageManager": "npm@11.17.0",
+  "dependencies": {
+    "@angular/common": "^22.1.0",
+    "@angular/compiler": "^22.1.0",
+    "@angular/core": "^22.1.0",
+    "@angular/forms": "^22.1.0",
+    "@angular/platform-browser": "^22.1.0",
+    "rxjs": "~7.8.0",
+    "tslib": "^2.3.0"
+  },
+  "devDependencies": {
+    "@angular/build": "^22.1.4",
+    "@angular/cli": "^22.1.4",
+    "@angular/compiler-cli": "^22.1.0",
+    "autoprefixer": "^10.4.21",
+    "postcss": "^8.5.6",
+    "tailwindcss": "^3.4.19",
+    "typescript": "~6.0.2"
+  }
+}

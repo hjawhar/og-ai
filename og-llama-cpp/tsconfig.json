@@ -18,5 +18,5 @@
     "noUnusedParameters": true,
     "skipLibCheck": true
   },
-  "include": ["tools/**/*.ts"]
+  "include": ["serve.ts", "tools/**/*.ts", "ui/server/**/*.ts", "test/**/*.ts"]
 }

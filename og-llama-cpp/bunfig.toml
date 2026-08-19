@@ -1,0 +1,5 @@
+# `bun test` covers the Bun side of this project only. The Angular workspace in
+# ui/ has its own toolchain (and its own .spec files, which need @angular/core
+# testing and a browser), so it is excluded rather than half-run here.
+[test]
+root = "test"

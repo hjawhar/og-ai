@@ -2,13 +2,17 @@
   "name": "og-llama-cpp",
   "version": "0.1.0",
   "private": true,
-  "description": "Pinned llama.cpp CUDA llama-server: installers and measurement tooling",
+  "description": "Pinned llama.cpp CUDA llama-server: installers, serving, UI and measurement tooling",
   "license": "MIT",
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit",
+    "serve": "bun run serve.ts",
+    "ui": "bun run ui/server/main.ts",
+    "ui:build": "cd ui && npm run build",
     "bench": "bun run tools/bench.ts",
-    "sweep": "bun run tools/profile-sweep.ts"
+    "sweep": "bun run tools/profile-sweep.ts",
+    "test": "bun test"
   },
   "devDependencies": {
     "@types/bun": "latest",

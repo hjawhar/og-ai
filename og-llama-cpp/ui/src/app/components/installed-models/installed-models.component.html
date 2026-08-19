@@ -1,0 +1,72 @@
+@if (models().length === 0) {
+  <p class="empty">
+    No <code class="font-mono">.gguf</code> files in
+    <code class="font-mono">{{ modelsDir() }}</code> yet — pick one from the catalogue below.
+  </p>
+} @else {
+  <div class="scroller">
+    <table class="grid-table">
+      <thead>
+        <tr>
+          <th>Model</th>
+          <th class="num">Size</th>
+          <th>Fits this GPU?</th>
+          <th>Working</th>
+          <th class="actions-head">Launch</th>
+        </tr>
+      </thead>
+      <tbody>
+        @for (model of models(); track model.file) {
+          <tr [class.row--blocked]="model.incomplete">
+            <td>
+              <span class="file font-mono">{{ model.file }}</span>
+              <span class="chips">
+                @for (chip of chipsFor(model); track chip) {
+                  <span class="chip">{{ chip }}</span>
+                }
+              </span>
+            </td>
+            <td class="num">
+              {{ model.sizeBytes | bytes }}
+              @if (model.incomplete; as partial) {
+                <span class="incomplete">
+                  incomplete: {{ partial.haveBytes | bytes }} of {{ partial.expectBytes | bytes }}
+                </span>
+              }
+            </td>
+            <td><og-verdict-badge [fit]="model.fit" /></td>
+            <td class="detail">
+              {{ model.fit.detail }}
+              @if (model.measured) {
+                <span class="measured"><strong>measured</strong> · {{ model.measured }}</span>
+              }
+            </td>
+            <td>
+              <div class="launch">
+                <label class="ctx">
+                  <span class="ctx__label">ctx</span>
+                  <input
+                    type="number"
+                    step="1024"
+                    min="512"
+                    [value]="ctxFor(model)"
+                    (change)="setCtx(model, $any($event.target).value)"
+                  />
+                </label>
+                <button
+                  type="button"
+                  class="btn btn--primary"
+                  [disabled]="!!model.incomplete || serving() === model.file"
+                  [title]="model.incomplete ? 'Still downloading or truncated' : 'Launch through serve.ts'"
+                  (click)="serve(model)"
+                >
+                  {{ serving() === model.file ? 'Starting…' : 'Serve' }}
+                </button>
+              </div>
+            </td>
+          </tr>
+        }
+      </tbody>
+    </table>
+  </div>
+}

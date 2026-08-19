@@ -1,0 +1,68 @@
+@let snapshot = state();
+
+<header class="topbar">
+  <h1 class="topbar__title">llama.cpp models</h1>
+  @if (snapshot) {
+    <og-server-status
+      class="topbar__status"
+      [server]="snapshot.server"
+      [stopping]="stopping()"
+      (stopRequested)="stopServer()"
+    />
+  }
+</header>
+
+<main class="page">
+  @if (error(); as message) {
+    <p class="banner" role="alert">{{ message }}</p>
+  }
+
+  @if (snapshot) {
+    <og-hardware-panel
+      [hardware]="snapshot.hardware"
+      [engine]="snapshot.engine"
+      [serving]="snapshot.server.reachable"
+    />
+
+    <p class="note">
+      Verdicts are computed for <strong>ctx {{ snapshot.ctx }}</strong> against a
+      <strong>{{ snapshot.hardware.budgetMiB | mib: 'gib' }}</strong> budget: weights, plus the q8_0
+      KV cache that context needs, plus ~900 MiB of runtime. A row marked
+      <strong>measured</strong> is a real run recorded in docs/benchmarks.md; everything else is
+      estimated from the GGUF's own metadata. Weights that do not fit still load and still answer —
+      the driver just pages them to host RAM and runs about 8x slower, with nothing in any log to
+      say so.
+    </p>
+
+    <section class="section">
+      <h2 class="section__title">
+        Installed weights
+        <span class="section__hint font-mono">{{ snapshot.modelsDir }}</span>
+      </h2>
+      <og-installed-models
+        [models]="snapshot.installed"
+        [modelsDir]="snapshot.modelsDir"
+        [defaultCtx]="snapshot.ctx"
+        [serving]="servingFile()"
+        (serveRequested)="serve($event)"
+      />
+    </section>
+
+    <section class="section">
+      <h2 class="section__title">Available to download</h2>
+      <og-model-catalog
+        [entries]="snapshot.catalog"
+        [busyKey]="busyKey()"
+        (downloadRequested)="download($event)"
+        (cancelRequested)="cancelDownload($event)"
+      />
+    </section>
+
+    <section class="section">
+      <h2 class="section__title">Server log</h2>
+      <og-server-log [lines]="snapshot.server.log" />
+    </section>
+  } @else if (!error()) {
+    <p class="note">Reading this machine…</p>
+  }
+</main>

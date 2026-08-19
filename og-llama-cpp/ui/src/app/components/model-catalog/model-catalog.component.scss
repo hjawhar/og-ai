@@ -1,0 +1,140 @@
+.scroller {
+  overflow-x: auto;
+  border: 1px solid var(--surface-line);
+  border-radius: 0.5rem;
+  background: var(--surface-panel);
+}
+
+.grid-table {
+  width: 100%;
+  min-width: 62rem;
+  border-collapse: collapse;
+
+  th {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    padding: 0.5rem 0.75rem;
+    background: var(--surface-raised);
+    border-bottom: 1px solid var(--surface-line);
+    text-align: left;
+    font-size: 0.6875rem;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--ink-dim);
+    white-space: nowrap;
+  }
+
+  td {
+    padding: 0.75rem;
+    border-bottom: 1px solid var(--surface-line);
+    vertical-align: top;
+    font-size: 0.8125rem;
+  }
+
+  tbody tr:nth-child(even) td {
+    background: color-mix(in srgb, var(--surface-raised) 45%, transparent);
+  }
+
+  tbody tr:last-child td {
+    border-bottom: none;
+  }
+}
+
+.num {
+  text-align: right;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.actions-head {
+  text-align: right;
+}
+
+// Fixed width so the cell does not jump between Download, a progress bar and a badge.
+.actions {
+  width: 17rem;
+  text-align: right;
+}
+
+.name {
+  display: block;
+  color: var(--ink-bright);
+  font-weight: 600;
+}
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  margin: 0.375rem 0;
+}
+
+.chip {
+  padding: 0.0625rem 0.4375rem;
+  border: 1px solid var(--surface-line);
+  border-radius: 0.25rem;
+  font-size: 0.6875rem;
+  color: var(--ink-dim);
+  white-space: nowrap;
+}
+
+.file {
+  display: block;
+  font-size: 0.6875rem;
+  color: var(--ink-faint);
+  overflow-wrap: anywhere;
+}
+
+.detail {
+  max-width: 26rem;
+  color: var(--ink-dim);
+  line-height: 1.45;
+}
+
+.progress {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.375rem;
+
+  &__text {
+    font-size: 0.6875rem;
+    color: var(--ink-dim);
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+.bar {
+  display: block;
+  width: 100%;
+  height: 0.375rem;
+  border-radius: 999px;
+  background: var(--surface-raised);
+  overflow: hidden;
+
+  > i {
+    display: block;
+    height: 100%;
+    background: var(--accent);
+    transition: width 400ms linear;
+  }
+}
+
+.installed {
+  display: inline-block;
+  padding: 0.0625rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--verdict-fits);
+  background: color-mix(in srgb, var(--verdict-fits) 14%, transparent);
+}
+
+.failed {
+  display: block;
+  margin-top: 0.375rem;
+  font-size: 0.6875rem;
+  color: var(--verdict-no);
+}

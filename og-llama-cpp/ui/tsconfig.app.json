@@ -1,0 +1,8 @@
+/* Application build configuration — https://angular.dev/reference/configs/angular-compiler-options */
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": []
+  },
+  "include": ["src/**/*.ts"]
+}

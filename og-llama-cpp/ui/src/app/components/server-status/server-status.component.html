@@ -1,0 +1,42 @@
+<div class="status">
+  <span
+    class="dot"
+    [class.dot--live]="ready()"
+    [class.dot--pending]="server().launching"
+  ></span>
+
+  <div class="status__text">
+    @if (ready()) {
+      <span class="font-mono text-ink-bright">{{ server().url }}</span>
+      @if (served(); as model) {
+        <span class="text-ink-dim">
+          · {{ model.id }}@if (model.nCtx) { · ctx {{ model.nCtx }} }
+        </span>
+      }
+      @if (server().launchedHere) {
+        <span class="text-ink-faint">· launched here (pid {{ server().pid }})</span>
+      }
+    } @else if (server().launching) {
+      <span>
+        loading weights on <span class="font-mono">{{ server().url }}</span> — a 16 GiB file takes
+        seconds to minutes
+      </span>
+    } @else {
+      <span>nothing serving on <span class="font-mono">{{ server().url }}</span></span>
+    }
+  </div>
+
+  <button
+    type="button"
+    class="btn btn--danger"
+    [disabled]="!server().launchedHere || stopping()"
+    (click)="stopRequested.emit()"
+  >
+    {{ stopping() ? 'Stopping…' : 'Stop server' }}
+  </button>
+</div>
+
+<button type="button" class="hint" (click)="copyHint()" title="Copy to clipboard">
+  <span class="font-mono">{{ clientHint() }}</span>
+  <span class="hint__action">copy</span>
+</button>
