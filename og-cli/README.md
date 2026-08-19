@@ -58,6 +58,33 @@ og-ai/
 
 ```sh
 git clone https://github.com/hjawhar/og-ai && cd og-ai/og-cli
+./install.sh --add-to-path   # bun install + bun run build + onto PATH, verified
+```
+
+`install.sh` covers Ubuntu, macOS and Windows (Git Bash / MSYS2) in one code path: it checks for
+Bun >= 1.3, builds, installs to `~/.local/bin/og` (`og.exe` on Windows, `--dest DIR` or
+`OG_INSTALL_DIR` elsewhere), and runs the result once so a binary that cannot start is not reported
+as a success. Re-running it is safe while `og` is running: the new binary is renamed into place, so
+a live process keeps the old one until it exits.
+
+`--add-to-path` is the difference between "installed" and "runnable as `og`". It appends
+`export PATH="<dir>:$PATH"` to the rc file a new interactive shell actually reads, and on Windows
+also adds the directory to the user `Path` in the registry. Both are idempotent, and without the
+flag the script only prints what to run. On Windows the rc file is **`~/.bash_profile`**, not
+`~/.bashrc`: Git Bash starts as a login shell and Git for Windows' `/etc/bash.bashrc` never sources
+`~/.bashrc`, so a line put there is read by nothing.
+
+Two Windows traps make a correct registry `Path` look broken, which is why `--add-to-path` writes
+the rc file too. A terminal application caches the environment it started with, so a new *tab*
+inherits the old `Path` and only restarting the application itself picks up the change. And Git
+Bash exports `ORIGINAL_PATH`, which its `/etc/profile` prefers over the current `PATH`
+(`${ORIGINAL_PATH:-$PATH}`), so any shell descended from a Git Bash that started before the edit
+keeps that older `Path` indefinitely. No shell can change its own parent's environment either, so
+the shell you run the installer in always needs the printed `export` line pasted once.
+
+By hand it is three commands:
+
+```sh
 bun install                  # dev dependencies: typescript + @types/bun, nothing else
 bun run build                # -> dist/og, one self-contained executable (dist/og.exe on Windows)
 install -m755 dist/og ~/.local/bin/og        # or anywhere on PATH

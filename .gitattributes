@@ -1,0 +1,5 @@
+# Shell scripts must arrive with LF even on a Windows checkout (core.autocrlf=true
+# is the Git for Windows default): CRLF makes bash fail on the shebang line, so
+# `./og-cli/install.sh` and `./og-llama-cpp/install-engine.sh` would break on the
+# very box that produced the commit.
+*.sh text eol=lf
