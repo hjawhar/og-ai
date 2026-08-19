@@ -49,7 +49,11 @@ workspace under `og-llama-cpp/ui/` — is named in the second bullet rather than
   Verification is local and manual — the commands below are the whole contract.
 - **Measured numbers only.** Every VRAM and throughput figure in either tree comes from a real run
   on the reference box, recorded in `og-llama-cpp/docs/benchmarks.md`. Do not adjust one without
-  re-measuring and saying on what.
+  re-measuring and saying on what. One carve-out, in one file: `og-llama-cpp/ui/server/compute.ts`
+  holds vendor-published SM counts and boost clocks so the UI can show a card's **peak** FLOPS and
+  TOPS. Those are labelled "peak" wherever they surface, every row is cross-checked against
+  NVIDIA's own published FP32 figure in `og-llama-cpp/test/compute.test.ts`, an unlisted card gets
+  no peak instead of a guess, and none of it is ever copied into `docs/benchmarks.md`.
 - Comments explain *why* (a constraint, a measurement, a failure mode), not *what*.
 
 ---
@@ -105,9 +109,14 @@ Run from `og-cli/`:
   needs an OpenAI-compatible server **already listening** at `endpoint` — bring one up with
   `bun run serve.ts` in `og-llama-cpp/`, or point `--endpoint` at a hosted API.
 - `bun run build` — `dist/og` (`dist/og.exe` when built on Windows).
+- `./install.sh` — build plus install onto `PATH`; `--dest DIR` / `OG_INSTALL_DIR` override
+  `~/.local/bin`, `--add-to-path` writes the shell rc file (and the Windows registry user `Path`)
+  idempotently. Ubuntu, macOS and Windows Git Bash/MSYS2 in one script; it is the only place that
+  knows the platform `.exe` suffix, which rc file a login shell reads (`~/.bash_profile` on
+  Windows, never `~/.bashrc`), and the per-platform PATH edit.
 
 Distribution: none. `og` is built from source — `bun build --compile` emits a self-contained
-`dist/og` that embeds its runtime, and you copy it onto `PATH`. It cannot run on Node
+`dist/og` that embeds its runtime, and `install.sh` copies it onto `PATH`. It cannot run on Node
 (`bun:sqlite`, `Bun.spawn`, `Bun.Glob`), and there is no package to publish, no launcher shim and
 no version to keep in sync anywhere but `package.json`.
 
@@ -159,7 +168,8 @@ directory. Server lifecycle lives here and only here.
   `POST /api/server/stop`). An unbuilt UI answers `503` on the page and keeps `/api/*` working.
   It reports hardware, installed weights, the download catalogue and a fit verdict per model,
   reads GGUF metadata directly to size a KV cache, and launches models by spawning `serve.ts`
-  rather than composing an argv.
+  rather than composing an argv. `ui/server/compute.ts` is the peak FLOPS/TOPS table — the one
+  place holding numbers nobody measured here, and the only file allowed to.
 - `tools/bench.ts` — raw kernel ceiling via `llama-bench` (pp/tg, no KV-cache pressure).
 - `tools/profile-sweep.ts` — starts `llama-server` per case, samples VRAM, measures prefill and
   generation throughput, tears it down.
